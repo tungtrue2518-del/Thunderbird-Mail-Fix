@@ -108,3 +108,15 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 - Windows 10 / 11 (มี .NET Framework 4 และ Windows PowerShell 5.1 มาให้แล้ว)
 - Mozilla Thunderbird (โปรไฟล์อยู่ใต้ `%APPDATA%\Thunderbird`)
+
+## ผู้พัฒนา
+
+พัฒนาโดย [@tungtrue2518-del](https://github.com/tungtrue2518-del)
+พบปัญหาหรือมีข้อเสนอแนะ เปิด [Issue](../../issues) ได้เลย
+
+## License
+
+[MIT](LICENSE) – ใช้งาน แก้ไข และแจกจ่ายต่อได้ฟรี
+
+> โปรแกรมนี้ไม่ได้เป็นผลิตภัณฑ์ของ Mozilla และไม่ได้รับการรับรองจาก Mozilla
+> "Thunderbird" เป็นเครื่องหมายการค้าของ Mozilla Foundation
