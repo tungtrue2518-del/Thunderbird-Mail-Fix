@@ -522,7 +522,9 @@ $form.StartPosition = 'CenterScreen'; $form.FormBorderStyle = 'FixedSingle'; $fo
 $form.BackColor = $C.Bg; $form.Font = F 9.5
 $tbExe = @("$env:ProgramFiles\Mozilla Thunderbird\thunderbird.exe", "${env:ProgramFiles(x86)}\Mozilla Thunderbird\thunderbird.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($tbExe) { try { $form.Icon = [Drawing.Icon]::ExtractAssociatedIcon($tbExe) } catch {} }
+$selfExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$iconSrc = if ($selfExe -notmatch '\\powershell(_ise)?\.exe$') { $selfExe } else { $tbExe }   # packaged exe has its own icon
+if ($iconSrc) { try { $form.Icon = [Drawing.Icon]::ExtractAssociatedIcon($iconSrc) } catch {} }
 
 # --- Header ---------------------------------------------------------------------
 $hdr = New-Object Windows.Forms.Panel

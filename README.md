@@ -28,15 +28,11 @@ A single-file PowerShell tool with a window that scans every Thunderbird mail ac
 
 ## วิธีใช้ / How to use
 
-1. ดาวน์โหลด `Thunderbird-Fix-Tool.ps1` ไปไว้ที่เครื่องที่มีปัญหา
-2. คลิกขวาที่ไฟล์ > **Run with PowerShell** (โปรแกรมจะขอสิทธิ์ Administrator เอง)
-   หรือรันคำสั่ง:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\Thunderbird-Fix-Tool.ps1
-   ```
-3. โปรแกรมสแกนทุกบัญชีให้อัตโนมัติ บัญชีที่มีปัญหาจะขึ้นสีแดงและถูกติ๊กไว้
-4. กด **แก้ไขอัตโนมัติทุกบัญชีที่มีปัญหา** หรือเลือกบัญชีเองแล้วกด **แก้ไขบัญชีที่เลือก**
-5. เปิด Thunderbird แล้วทดสอบ หากยังมีปัญหาในโฟลเดอร์ใด คลิกขวาที่โฟลเดอร์ > Properties > Repair Folder
+1. เปิด **`ThunderbirdMailFix.exe`** (ไฟล์เดียว ไม่ต้องติดตั้ง วางบน shared server แล้วดับเบิลคลิกได้เลย) แล้วกด **Yes** ที่หน้าต่างขอสิทธิ์ Administrator
+   หรือใช้แบบสคริปต์: คลิกขวาที่ `Thunderbird-Fix-Tool.ps1` > **Run with PowerShell**
+2. โปรแกรมสแกนทุกบัญชีให้อัตโนมัติ บัญชีที่มีปัญหาจะขึ้นสีแดงและถูกติ๊กไว้
+3. กด **แก้ไขอัตโนมัติทุกบัญชีที่มีปัญหา** หรือเลือกบัญชีเองแล้วกด **แก้ไขบัญชีที่เลือก**
+4. เปิด Thunderbird แล้วทดสอบ หากยังมีปัญหาในโฟลเดอร์ใด คลิกขวาที่โฟลเดอร์ > Properties > Repair Folder
 
 ### ตัวเลือก / Options
 - **สร้างดัชนีโฟลเดอร์ใหม่ทั้งหมด (.msf)** – ใช้เมื่อยังพบข้อผิดพลาดซ้ำ
@@ -49,6 +45,18 @@ A single-file PowerShell tool with a window that scans every Thunderbird mail ac
 - `prefs.js` ถูกสำรองก่อนแก้ไขทุกครั้ง
 - Thunderbird จะถูกปิดก่อนเริ่มแก้ไข (โปรแกรมจะถามก่อน)
 - เมื่อรันแบบ Administrator จะสแกนทุกผู้ใช้ Windows ในเครื่อง ถ้าไม่ใช่ Admin จะสแกนเฉพาะผู้ใช้ปัจจุบัน
+
+## สร้างไฟล์ .exe / Build the exe
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+ได้ไฟล์ `dist\ThunderbirdMailFix.exe` (ประมาณ 170 KB) ใช้ C# compiler ที่มากับ Windows (.NET Framework 4) ไม่ต้องติดตั้งอะไรเพิ่ม
+สคริปต์ทั้งหมดถูกฝังไว้ใน exe และรันภายในตัวโปรแกรมเอง (`build\Launcher.cs`)
+
+- ผู้ใช้ที่เป็น Admin จะถูกถามสิทธิ์ (UAC) และแก้ได้ทุกผู้ใช้ในเครื่อง ผู้ใช้ทั่วไปเปิดได้เลยแต่แก้ได้เฉพาะโปรไฟล์ตัวเอง
+- exe ไม่ได้ลงลายเซ็นดิจิทัล Windows SmartScreen / แอนตี้ไวรัสบางตัวอาจเตือนครั้งแรก ให้กด "More info > Run anyway" หรือเพิ่มเป็นข้อยกเว้น
 
 ## Requirements
 
