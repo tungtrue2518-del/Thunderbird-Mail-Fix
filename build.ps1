@@ -88,8 +88,13 @@ $manifest = Join-Path $env:TEMP "tbfix-$Level.manifest"
 (Get-Content "$buildDir\app.manifest" -Raw) -replace '__LEVEL__', $Level | Set-Content $manifest -Encoding UTF8
 New-Item -ItemType Directory -Force (Split-Path $Out -Parent) | Out-Null
 
+$version = if ((Get-Content $Script -Raw -Encoding UTF8) -match "\`$AppVersion\s*=\s*'([\d.]+)'") { $Matches[1] } else { '1.0.0' }
+$launcher = Join-Path $env:TEMP 'tbfix-Launcher.cs'
+(Get-Content "$buildDir\Launcher.cs" -Raw -Encoding UTF8) -replace '__VERSION__', $version |
+    Set-Content $launcher -Encoding UTF8
+
 & $csc /nologo /optimize+ /codepage:65001 /target:winexe /platform:anycpu "/out:$Out" "/win32icon:$icon" "/win32manifest:$manifest" `
-    "/reference:$sma" /reference:System.Windows.Forms.dll "/resource:$Script,tool.ps1" "$buildDir\Launcher.cs"
+    "/reference:$sma" /reference:System.Windows.Forms.dll "/resource:$Script,tool.ps1" $launcher
 if ($LASTEXITCODE -ne 0) { throw "csc failed ($LASTEXITCODE)" }
-Remove-Item $manifest
-"built:    $Out  ($([math]::Round((Get-Item $Out).Length / 1KB)) KB, $Level)"
+Remove-Item $manifest, $launcher
+"built:    $Out  ($([math]::Round((Get-Item $Out).Length / 1KB)) KB, v$version, $Level)"

@@ -36,8 +36,18 @@ if (-not $isAdmin -and $PSCommandPath) {
     } catch { }   # user pressed "No" on UAC - continue without admin
 }
 
+$AppVersion = '1.1.0'
+
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Only one copy at a time - two copies fixing the same profile would fight over the files
+$mutex = New-Object Threading.Mutex($false, 'ThunderbirdMailFix-SingleInstance')
+$ownsMutex = try { $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $true }
+if (-not $ownsMutex) {
+    [Windows.Forms.MessageBox]::Show('Thunderbird Mail Fix เปิดอยู่แล้ว', 'Thunderbird Mail Fix', 'OK', 'Information') | Out-Null
+    return
+}
 
 # Hide the black console window behind the GUI
 Add-Type -Name Win -Namespace Native -MemberDefinition @'
@@ -85,7 +95,11 @@ $engine = {
             $p = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
             if ($p) { $sidByPath[$p.ToLower()] = $_.PSChildName }
         }
-        $userDirs = if ($opt.IsAdmin) { Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue } else { @(Get-Item $env:USERPROFILE) }
+        # every Windows profile folder (ProfileList also finds profiles that are not on C:)
+        $userDirs = if ($opt.IsAdmin) {
+            @($sidByPath.Keys | Where-Object { Test-Path $_ } | ForEach-Object { Get-Item $_ }) +
+            @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue) | Sort-Object FullName -Unique
+        } else { @(Get-Item $env:USERPROFILE) }
         $found = @()
         foreach ($u in $userDirs) {
             $tbRoot = Join-Path $u.FullName 'AppData\Roaming\Thunderbird'
@@ -101,7 +115,7 @@ $engine = {
                         $full = if ($section.IsRelative -ne '0') { Join-Path $tbRoot ($p -replace '/', '\') } else { $p }
                         if (Test-Path $full) {
                             $found += [pscustomobject]@{
-                                User = $u.Name; Path = (Resolve-Path $full).Path; OwnerSid = $sid
+                                User = $u.Name; UserDir = $u.FullName; Path = (Resolve-Path $full).Path; OwnerSid = $sid
                                 # who counts as "the user can write": owner, Everyone, Authenticated Users, Users
                                 Sids = @($sid, 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') }
                         }
@@ -178,13 +192,16 @@ $engine = {
         $k = "${hostName}:$port"
         if ($netCache.ContainsKey($k)) { return $netCache[$k] }
         $res = 'ok'
-        try { [void][Net.Dns]::GetHostAddresses($hostName) } catch { $res = 'dns' }
+        try {   # DNS with a timeout - a broken DNS server must not freeze the scan
+            $dns = [Net.Dns]::BeginGetHostAddresses($hostName, $null, $null)
+            if ($dns.AsyncWaitHandle.WaitOne(5000)) { [void][Net.Dns]::EndGetHostAddresses($dns) } else { $res = 'dns' }
+        } catch { $res = 'dns' }
         if ($res -eq 'ok') {
-            $c = New-Object Net.Sockets.TcpClient
+            $tcp = New-Object Net.Sockets.TcpClient
             try {
-                $ar = $c.BeginConnect($hostName, $port, $null, $null)
-                if (-not ($ar.AsyncWaitHandle.WaitOne(5000) -and $c.Connected)) { $res = 'port' }
-            } catch { $res = 'port' } finally { $c.Close() }
+                $ar = $tcp.BeginConnect($hostName, $port, $null, $null)
+                if (-not ($ar.AsyncWaitHandle.WaitOne(5000) -and $tcp.Connected)) { $res = 'port' }
+            } catch { $res = 'port' } finally { $tcp.Close() }
         }
         $netCache[$k] = $res; $res
     }
@@ -355,56 +372,181 @@ $engine = {
         if ($code -eq 0) { Log 'OK' 'รีเซ็ตสิทธิ์ Full Control เรียบร้อย' } else { Log 'WARN' "รีเซ็ตสิทธิ์ไม่สำเร็จบางไฟล์: $r" }
     }
 
+    # Closes Thunderbird cleanly (it saves its files on exit); forces it only after 15 s
+    function Stop-Thunderbird {
+        if (-not (Get-Process thunderbird -ErrorAction SilentlyContinue)) { return $true }
+        $sync.StatusText = 'กำลังปิด Thunderbird...'
+        Get-Process thunderbird -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+        for ($i = 0; $i -lt 30 -and (Get-Process thunderbird -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 500 }
+        if (Get-Process thunderbird -ErrorAction SilentlyContinue) {
+            Log 'WARN' 'Thunderbird ไม่ปิดเองภายใน 15 วินาที - บังคับปิด'
+            Get-Process thunderbird -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+        if (Get-Process thunderbird -ErrorAction SilentlyContinue) {
+            Log 'ERR' 'ปิด Thunderbird ไม่ได้ - กรุณาปิดเองแล้วลองใหม่ (ยังไม่ได้แก้ไขอะไร)'
+            return $false
+        }
+        Log 'OK' 'ปิด Thunderbird แล้ว'
+        $true
+    }
+
+    function Remove-Locks($pr) {
+        foreach ($lock in 'parent.lock', 'lock', '.parentlock') {
+            $lp = Join-Path $pr.Path $lock
+            if (Test-Path $lp) { Remove-Item $lp -Force -ErrorAction SilentlyContinue; Log 'OK' "ลบไฟล์ล็อกโปรไฟล์: $lp" }
+        }
+    }
+
+    function Clear-TbTemp($profs) {
+        $n = 0
+        $tempDirs = @($env:TEMP) + @($profs | ForEach-Object { Join-Path $_.UserDir 'AppData\Local\Temp' }) | Sort-Object -Unique
+        foreach ($t in $tempDirs) {
+            Get-ChildItem -Path $t -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^(nsmail|nscopy|nsemail|nsma|nsmime|nscpmsg)' } |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue; $n++ }
+        }
+        Log 'OK' "ล้างไฟล์ชั่วคราวของ Thunderbird $n ไฟล์"
+    }
+
+    # --- SQLite through winsqlite3.dll (built into Windows 10/11) ---------------
+    function Initialize-Sqlite {
+        if (-not (Test-Path "$env:SystemRoot\System32\winsqlite3.dll")) { return $false }
+        if (-not ('TbFix.Sqlite' -as [type])) {
+            Add-Type -Namespace TbFix -Name Sqlite -MemberDefinition @'
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_open16", CharSet = CharSet.Unicode)] public static extern int Open(string file, out IntPtr db);
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_close_v2")] public static extern int Close(IntPtr db);
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_busy_timeout")] public static extern int BusyTimeout(IntPtr db, int ms);
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_prepare16_v2", CharSet = CharSet.Unicode)] public static extern int Prepare(IntPtr db, string sql, int bytes, out IntPtr stmt, IntPtr tail);
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_step")] public static extern int Step(IntPtr stmt);
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_column_text16")] public static extern IntPtr ColumnText(IntPtr stmt, int col);
+[DllImport("winsqlite3.dll", EntryPoint = "sqlite3_finalize")] public static extern int Finalize(IntPtr stmt);
+'@
+        }
+        $true
+    }
+
+    # Runs one statement; returns the first column of all rows joined, or "error <code>"
+    function Invoke-Sqlite([string]$file, [string]$sql) {
+        $db = [IntPtr]::Zero
+        if ([TbFix.Sqlite]::Open($file, [ref]$db) -ne 0) { if ($db -ne [IntPtr]::Zero) { [void][TbFix.Sqlite]::Close($db) }; return 'error open' }
+        try {
+            [void][TbFix.Sqlite]::BusyTimeout($db, 5000)
+            $stmt = [IntPtr]::Zero
+            $rc = [TbFix.Sqlite]::Prepare($db, $sql, -1, [ref]$stmt, [IntPtr]::Zero)
+            if ($rc -ne 0) { return "error $rc" }
+            $rows = @()
+            while (($rc = [TbFix.Sqlite]::Step($stmt)) -eq 100) {
+                $rows += [Runtime.InteropServices.Marshal]::PtrToStringUni([TbFix.Sqlite]::ColumnText($stmt, 0))
+            }
+            [void][TbFix.Sqlite]::Finalize($stmt)
+            if ($rc -ne 101) { return "error $rc" }
+            $rows -join '; '
+        } finally { [void][TbFix.Sqlite]::Close($db) }
+    }
+
+    # Files Thunderbird simply recreates when they are missing - safe to move away when broken
+    $rebuildableDb   = 'global-messages-db.sqlite', 'favicons.sqlite', 'places.sqlite', 'formhistory.sqlite', 'content-prefs.sqlite',
+                       'permissions.sqlite', 'webappsstore.sqlite', 'storage.sqlite', 'cookies.sqlite', 'bounce-tracking-protection.sqlite', 'cache.sqlite'
+    $rebuildableJson = 'xulstore.json', 'folderCache.json', 'folderTree.json', 'session.json', 'sessionCheckpoints.json', 'times.json', 'handlers.json'
+
+    function Optimize-Profile($pr, $profAccounts) {
+        Log 'STEP' "Optimize โปรไฟล์ $(Split-Path $pr.Path -Leaf) ($($pr.User))"
+        Remove-Locks $pr
+
+        # 1. caches
+        $local = Join-Path $pr.UserDir "AppData\Local\Thunderbird\Profiles\$(Split-Path $pr.Path -Leaf)"
+        foreach ($cacheDir in @((Join-Path $pr.Path 'startupCache'), (Join-Path $local 'cache2'), (Join-Path $local 'startupCache'))) {
+            if (Test-Path $cacheDir) { Remove-Item $cacheDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        Log 'OK' 'ล้างแคชของ Thunderbird แล้ว'
+
+        # 2. databases: integrity check, then VACUUM
+        if (Initialize-Sqlite) {
+            $dbs = @(Get-ChildItem $pr.Path -Filter '*.sqlite' -File -ErrorAction SilentlyContinue) +
+                   @(Get-ChildItem (Join-Path $pr.Path 'calendar-data') -Filter '*.sqlite' -File -ErrorAction SilentlyContinue)
+            $saved = [int64]0; $okCount = 0
+            foreach ($db in $dbs) {
+                $check = Invoke-Sqlite $db.FullName 'PRAGMA quick_check;'
+                if ($check -ne 'ok') {
+                    if ($rebuildableDb -contains $db.Name) {
+                        foreach ($f in @($db.FullName, "$($db.FullName)-wal", "$($db.FullName)-shm") | Where-Object { Test-Path -LiteralPath $_ }) { [void](Move-ToBackup $f $pr.Path) }
+                        Log 'OK' "ฐานข้อมูล $($db.Name) เสีย - ย้ายไปโฟลเดอร์สำรอง Thunderbird จะสร้างใหม่"
+                    } else {
+                        Copy-Item -LiteralPath $db.FullName (Join-Path $backupDir "$($db.Name).damaged") -Force -ErrorAction SilentlyContinue
+                        Log 'WARN' "ฐานข้อมูล $($db.Name) เสีย ($check) - เก็บสำเนาไว้ในโฟลเดอร์สำรอง ต้องกู้คืนเอง (ไม่ลบให้เพราะมีข้อมูลสำคัญ)"
+                        $sync.OptWarn++
+                    }
+                    continue
+                }
+                if ($rebuildableDb -notcontains $db.Name) {   # address book, OpenPGP keys, calendar: keep a copy first
+                    Copy-Item -LiteralPath $db.FullName (Join-Path $backupDir $db.Name) -Force -ErrorAction SilentlyContinue
+                }
+                $before = $db.Length
+                $r = Invoke-Sqlite $db.FullName 'VACUUM;'
+                if ($r -like 'error*') { Log 'WARN' "บีบอัด $($db.Name) ไม่ได้ ($r)"; continue }
+                $saved += $before - (Get-Item -LiteralPath $db.FullName).Length; $okCount++
+            }
+            $sync.OptSaved += $saved
+            Log 'OK' "ตรวจและบีบอัดฐานข้อมูล $okCount/$($dbs.Count) ไฟล์ - ลดขนาดได้ $([math]::Round([math]::Max(0, $saved) / 1MB, 1)) MB"
+        } else { Log 'INFO' 'Windows นี้ไม่มี SQLite ในตัว - ข้ามการตรวจฐานข้อมูล' }
+
+        # 3. settings files that Thunderbird rewrites anyway
+        foreach ($j in @(Get-ChildItem $pr.Path -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $bad = $false
+            try { $txt = [IO.File]::ReadAllText($j.FullName); if ($txt.Trim()) { $null = $txt | ConvertFrom-Json -ErrorAction Stop } else { $bad = $true } }
+            catch { $bad = $true }
+            if (-not $bad) { continue }
+            if ($rebuildableJson -contains $j.Name) {
+                if (Move-ToBackup $j.FullName $pr.Path) { Log 'OK' "ไฟล์ตั้งค่า $($j.Name) เสีย - ย้ายออก Thunderbird จะสร้างใหม่" }
+            } elseif ($j.Name -notlike 'logins*') {
+                Log 'WARN' "ไฟล์ $($j.Name) อ่านไม่ได้ - ไม่ได้แก้ไขให้"; $sync.OptWarn++
+            } else {
+                Log 'WARN' "ไฟล์รหัสผ่าน $($j.Name) อ่านไม่ได้ - อาจต้องใส่รหัสผ่านใหม่"; $sync.OptWarn++
+            }
+        }
+
+        # 4. let Thunderbird compact folders by itself (removes deleted mail, keeps mailboxes small)
+        try {
+            Set-Prefs $pr.Path @{ 'mail.prompt_purge_threshhold' = 'true'; 'mail.purge_threshhold_mb' = '20'; 'mail.purge.ask' = 'false' }
+            Log 'OK' 'เปิด Auto-Compact (บีบอัดโฟลเดอร์อัตโนมัติเมื่อเกิน 20 MB)'
+        } catch { Log 'WARN' "ตั้งค่า Auto-Compact ไม่ได้: $($_.Exception.Message)" }
+
+        # 5. Trash / Junk that should be emptied
+        foreach ($acc in $profAccounts) {
+            if (-not $acc.Dir -or -not (Test-Path -LiteralPath $acc.Dir)) { continue }
+            Get-ChildItem -LiteralPath $acc.Dir -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -in 'Trash', 'Junk', 'Spam', 'Deleted Items', 'Deleted Messages' -and $_.Length -gt 300MB } |
+                ForEach-Object {
+                    Log 'WARN' "$($acc.Email): โฟลเดอร์ $($_.Name) ใหญ่ $([math]::Round($_.Length / 1MB)) MB - ควรคลิกขวา > Empty $($_.Name)"
+                    $sync.OptWarn++
+                }
+        }
+    }
+
     try {
         $tbRunning = [bool](Get-Process thunderbird -ErrorAction SilentlyContinue)
         Prog 3 'กำลังค้นหาโปรไฟล์ Thunderbird...'
-        $profiles = Get-TbProfiles
+        $profiles = @(Get-TbProfiles)   # @() - a single PSCustomObject has no .Count in PowerShell 5.1
         $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })
         if (-not $accounts) { Log 'WARN' 'ไม่พบบัญชีอีเมลใน Thunderbird บนเครื่องนี้'; $sync.Results = @(); return }
 
         if ($opt.Mode -eq 'fix') {
             New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
             Log 'INFO' "เริ่มแก้ไข $(Get-Date)   Admin=$($opt.IsAdmin)  RebuildIndex=$($opt.RebuildIndex)"
-            if ($tbRunning) {
-                Prog 5 'กำลังปิด Thunderbird...'
-                Get-Process thunderbird -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
-                Start-Sleep -Seconds 5
-                Get-Process thunderbird -ErrorAction SilentlyContinue | Stop-Process -Force
-                Start-Sleep -Seconds 2
-                Log 'OK' 'ปิด Thunderbird แล้ว'
-                $tbRunning = $false
-            }
-            $targets  = @($accounts | Where-Object { $opt.Targets -contains $_.Key })
+            # nothing is touched unless Thunderbird is really closed
+            $targets  = if (Stop-Thunderbird) { @($accounts | Where-Object { $opt.Targets -contains $_.Key }) } else { @() }
+            $tbRunning = [bool](Get-Process thunderbird -ErrorAction SilentlyContinue)
             $profUsed = @($targets | ForEach-Object { $_.Profile } | Sort-Object Path -Unique)
 
             foreach ($pr in $profUsed) {
-                foreach ($lock in 'parent.lock', 'lock', '.parentlock') {
-                    $lp = Join-Path $pr.Path $lock
-                    if (Test-Path $lp) { Remove-Item $lp -Force -ErrorAction SilentlyContinue; Log 'OK' "ลบไฟล์ล็อกโปรไฟล์: $lp" }
-                }
-                if ($opt.ClearCache) {
-                    # global search index + startup/network caches - Thunderbird rebuilds all of them
-                    $gdb = Join-Path $pr.Path 'global-messages-db.sqlite'
-                    if (Test-Path $gdb) { if (Move-ToBackup $gdb $pr.Path) { Log 'OK' 'ย้ายฐานข้อมูลค้นหา (global-messages-db) - จะสร้างใหม่อัตโนมัติ' } }
-                    $local = "C:\Users\$($pr.User)\AppData\Local\Thunderbird\Profiles\$(Split-Path $pr.Path -Leaf)"
-                    foreach ($c in @((Join-Path $pr.Path 'startupCache'), (Join-Path $local 'cache2'), (Join-Path $local 'startupCache'))) {
-                        if (Test-Path $c) { Remove-Item $c -Recurse -Force -ErrorAction SilentlyContinue }
-                    }
-                    Log 'OK' 'ล้างแคชของ Thunderbird แล้ว'
-                }
+                Remove-Locks $pr
                 if ($opt.Defender -and $opt.IsAdmin) {
                     try { Add-MpPreference -ExclusionPath $pr.Path -ErrorAction Stop; Log 'OK' "เพิ่มข้อยกเว้น Windows Defender: $($pr.Path)" }
                     catch { Log 'WARN' "เพิ่มข้อยกเว้น Defender ไม่ได้: $($_.Exception.Message)" }
                 }
             }
-            $tmp = 0
-            $tempDirs = @($env:TEMP) + @($profUsed | ForEach-Object { "C:\Users\$($_.User)\AppData\Local\Temp" }) | Sort-Object -Unique
-            foreach ($t in $tempDirs) {
-                Get-ChildItem -Path $t -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -match '^(nsmail|nscopy|nsemail|nsma|nsmime|nscpmsg)' } |
-                    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue; $tmp++ }
-            }
-            Log 'OK' "ล้างไฟล์ชั่วคราวของ Thunderbird $tmp ไฟล์"
+            if ($targets) { Clear-TbTemp $profUsed }
 
             for ($i = 0; $i -lt $targets.Count; $i++) {
                 Prog (10 + 50 * $i / $targets.Count) "กำลังแก้ไข $($targets[$i].Email) ($($i + 1)/$($targets.Count))"
@@ -414,7 +556,24 @@ $engine = {
             $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })   # prefs.js may have changed
         }
 
-        $base = if ($opt.Mode -eq 'fix') { 60 } else { 5 }
+        if ($opt.Mode -eq 'optimize') {
+            New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+            Log 'INFO' "เริ่ม Optimize $(Get-Date)   Admin=$($opt.IsAdmin)"
+            if (Stop-Thunderbird) {
+                Clear-TbTemp $profiles
+                for ($i = 0; $i -lt $profiles.Count; $i++) {
+                    Prog (10 + 50 * $i / $profiles.Count) "กำลัง Optimize โปรไฟล์ $($i + 1)/$($profiles.Count)"
+                    $pr = $profiles[$i]
+                    Optimize-Profile $pr @($accounts | Where-Object { $_.Profile.Path -eq $pr.Path })
+                }
+                $sync.OptDone = $true
+            }
+            $tbRunning = [bool](Get-Process thunderbird -ErrorAction SilentlyContinue)
+            Log 'STEP' 'สแกนตรวจสอบอีกครั้งหลัง Optimize'
+            $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })
+        }
+
+        $base = if ($opt.Mode -eq 'scan') { 5 } else { 60 }
         $results = @()
         for ($i = 0; $i -lt $accounts.Count; $i++) {
             Prog ($base + (95 - $base) * $i / $accounts.Count) "กำลังสแกน $($accounts[$i].Email) ($($i + 1)/$($accounts.Count))"
@@ -517,7 +676,7 @@ function Format-Size([int64]$b) {
 $W = 1000
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Thunderbird Mailbox Fix Tool'
-$form.ClientSize = New-Object Drawing.Size($W, 744)
+$form.ClientSize = New-Object Drawing.Size($W, 716)
 $form.StartPosition = 'CenterScreen'; $form.FormBorderStyle = 'FixedSingle'; $form.MaximizeBox = $false
 $form.BackColor = $C.Bg; $form.Font = F 9.5
 $tbExe = @("$env:ProgramFiles\Mozilla Thunderbird\thunderbird.exe", "${env:ProgramFiles(x86)}\Mozilla Thunderbird\thunderbird.exe") |
@@ -540,7 +699,8 @@ $hdr.Add_Paint({ param($s, $e)
         (New-Object Drawing.Rectangle(24, 18, 58, 58)), [Drawing.Color]::White, [Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter')
 })
 $form.Controls.Add($hdr)
-New-Label $hdr 'Thunderbird Mailbox Fix Tool' 96 14 (F 17 'Bold') ([Drawing.Color]::White) | Out-Null
+$lblTitle = New-Label $hdr 'Thunderbird Mailbox Fix Tool' 96 14 (F 17 'Bold') ([Drawing.Color]::White)
+New-Label $hdr "v$AppVersion" ($lblTitle.Left + $lblTitle.PreferredWidth + 4) 25 (F 9 'Bold') (Hex '#93C5FD') | Out-Null
 New-Label $hdr 'สแกนทุกบัญชีอีเมล - เขียนกล่องจดหมายไม่ได้ / เมลไม่เข้า / ส่งไม่ออก - และแก้ไขอัตโนมัติ' 99 54 (F 10) (Hex '#DBEAFE') | Out-Null
 
 $badge = New-Object Windows.Forms.Label
@@ -555,19 +715,23 @@ $btnBackup = New-Btn $hdr 'โฟลเดอร์สำรอง' ($W - 24 - 1
 $btnBackup.Enabled = $false
 
 # --- Toolbar --------------------------------------------------------------------
-$bar = New-Card $form 24 112 952 100 $null
-$btnScan   = New-Btn $bar 'สแกนใหม่' 14 27 120 46
-$btnFixSel = New-Btn $bar 'แก้ไขบัญชีที่เลือก' 144 27 170 46
-$btnFixAll = New-Btn $bar 'แก้ไขอัตโนมัติทุกบัญชีที่มีปัญหา' 324 27 268 46 -Primary
-$tglIndex  = New-Toggle $bar 624 10 'สร้างดัชนีโฟลเดอร์ใหม่ทั้งหมด (.msf)'
-$tglCache  = New-Toggle $bar 624 39 'ล้างแคช + ฐานข้อมูลค้นหา (ช้า / ค้นหาไม่เจอ)'
-$tglDef    = New-Toggle $bar 624 68 'ยกเว้นโปรไฟล์จาก Windows Defender'
+$bar = New-Card $form 24 112 952 72 $null
+$btnScan   = New-Btn $bar 'สแกนใหม่' 14 13 106 46
+$btnFixSel = New-Btn $bar 'แก้ไขบัญชีที่เลือก' 128 13 150 46
+$btnFixAll = New-Btn $bar 'แก้ไขอัตโนมัติทุกบัญชีที่มีปัญหา' 286 13 248 46 -Primary
+$btnOpt    = New-Btn $bar 'Optimize' 542 13 120 46 -bg (Hex '#0F766E') -hover (Hex '#115E59')
+$btnOpt.Font = F 10.5 'Bold'
+$tglIndex  = New-Toggle $bar 684 11 'สร้างดัชนีใหม่ (.msf)'
+$tglDef    = New-Toggle $bar 684 40 'ยกเว้นจาก Defender'
 $tt = New-Object Windows.Forms.ToolTip
 $tt.SetToolTip($btnFixAll, 'ปิด Thunderbird แล้วแก้ไขทุกบัญชีที่สถานะ "มีปัญหา" จากนั้นสแกนซ้ำเพื่อยืนยัน')
 $tt.SetToolTip($btnFixSel, 'แก้ไขเฉพาะบัญชีที่ติ๊กเลือกในรายการ (แก้ทุกขั้นตอนแม้ไม่พบปัญหา)')
+$tt.SetToolTip($btnOpt, 'ปรับแต่งให้ Thunderbird เสถียร: ตรวจ/บีบอัดฐานข้อมูล, ซ่อมไฟล์ตั้งค่าที่เสีย, ล้างแคช, เปิด Auto-Compact')
+$tt.SetToolTip($tglIndex, 'ย้ายไฟล์ดัชนี .msf ทั้งหมดออกตอนแก้ไข ให้ Thunderbird สร้างใหม่ - ใช้เมื่อยังพบข้อผิดพลาดซ้ำ')
+$tt.SetToolTip($tglDef, 'เพิ่มโฟลเดอร์โปรไฟล์ Thunderbird เป็นข้อยกเว้นของ Windows Defender (ต้องเป็น Admin)')
 
 # --- Account list ---------------------------------------------------------------
-$listCard = New-Card $form 24 224 952 300 'บัญชีอีเมลใน Thunderbird'
+$listCard = New-Card $form 24 196 952 300 'บัญชีอีเมลใน Thunderbird'
 $lblSummary = New-Label $listCard '' 420 15 (F 9.5) $C.Muted 400
 $lblSummary.TextAlign = 'MiddleRight'
 $lnkAll  = New-Object Windows.Forms.LinkLabel
@@ -594,24 +758,24 @@ $lblEmpty = New-Label $listCard 'กำลังสแกนบัญชี...' 
 $lblEmpty.TextAlign = 'MiddleCenter'; $lblEmpty.BackColor = 'White'; $lblEmpty.BringToFront()
 
 # --- Progress -------------------------------------------------------------------
-$lblStatus = New-Label $form 'พร้อมใช้งาน' 24 534 (F 9.5) $C.Muted 800
-$lblPct    = New-Label $form '' 876 534 (F 9.5 'Bold') $C.Accent 100
+$lblStatus = New-Label $form 'พร้อมใช้งาน' 24 506 (F 9.5) $C.Muted 800
+$lblPct    = New-Label $form '' 876 506 (F 9.5 'Bold') $C.Accent 100
 $lblPct.TextAlign = 'TopRight'
 $track = New-Object Windows.Forms.Panel
-$track.SetBounds(24, 560, 952, 8); $track.BackColor = Hex '#E2E8F0'
+$track.SetBounds(24, 532, 952, 8); $track.BackColor = Hex '#E2E8F0'
 $track.Region = New-Object Drawing.Region (New-RoundPath (New-Object Drawing.RectangleF(0, 0, 952, 8)) 4)
 $fill = New-Object Windows.Forms.Panel
 $fill.SetBounds(0, 0, 0, 8); $fill.BackColor = $C.Accent
 $track.Controls.Add($fill); $form.Controls.Add($track)
 
 # --- Details + log --------------------------------------------------------------
-$detCard = New-Card $form 24 580 466 150 'รายละเอียดบัญชี'
+$detCard = New-Card $form 24 552 466 150 'รายละเอียดบัญชี'
 $det = New-Object Windows.Forms.RichTextBox
 $det.SetBounds(18, 40, 436, 104); $det.BorderStyle = 'None'; $det.ReadOnly = $true; $det.BackColor = 'White'
 $det.Font = F 9.5; $det.ForeColor = $C.Muted; $det.Text = 'คลิกที่บัญชีในรายการเพื่อดูรายละเอียด'
 $detCard.Controls.Add($det)
 
-$logCard = New-Card $form 510 580 466 150 'บันทึกการทำงาน' $C.LogBg (Hex '#E2E8F0')
+$logCard = New-Card $form 510 552 466 150 'บันทึกการทำงาน' $C.LogBg (Hex '#E2E8F0')
 $log = New-Object Windows.Forms.RichTextBox
 $log.SetBounds(18, 40, 436, 104); $log.BorderStyle = 'None'; $log.ReadOnly = $true
 $log.BackColor = $C.LogBg; $log.ForeColor = $C.LogText; $log.Font = F 9
@@ -663,9 +827,10 @@ function Show-Details($r) {
     Add-Det "โฟลเดอร์: $($r.Dir)" $C.Muted (F 9)
     if (-not $r.Issues) { Add-Det 'ไม่พบปัญหา' $C.Green (F 9.5 'Bold') ([string][char]0x2714); return }
     foreach ($i in $r.Issues) {
-        $c = if ($i.Fixable -or $i.Code -eq 'DIR_MISSING') { $C.Red } else { $C.Amber }
+        # (not "$c": PowerShell names are case-insensitive and it would hide the $C colour table)
+        $issueColor = if ($i.Fixable -or $i.Code -in 'DIR_MISSING', 'NET_IN', 'NET_OUT', 'DISK') { $C.Red } else { $C.Amber }
         $tag = if ($i.Fixable) { '' } else { '  (ต้องแก้เอง)' }
-        Add-Det ("• " + $i.Text + $tag) $c (F 9.5)
+        Add-Det ("• " + $i.Text + $tag) $issueColor (F 9.5)
     }
     $det.SelectionStart = 0; $det.ScrollToCaret()
 }
@@ -698,8 +863,9 @@ function Update-AccountList {
 }
 
 function Set-Busy([bool]$busy) {
-    foreach ($b in $btnScan, $btnFixSel, $btnFixAll) { $b.Enabled = -not $busy }
+    foreach ($b in $btnScan, $btnFixSel, $btnFixAll, $btnOpt) { $b.Enabled = -not $busy }
     $btnFixAll.BackColor = if ($busy) { $C.AccentSoft } else { $C.Accent }
+    $btnOpt.BackColor    = if ($busy) { Hex '#99C9C4' } else { Hex '#0F766E' }
     $lv.Enabled = -not $busy
     $form.Cursor = if ($busy) { 'AppStarting' } else { 'Default' }
 }
@@ -707,13 +873,14 @@ function Set-Busy([bool]$busy) {
 function Start-Engine($mode, $keys) {
     Set-Busy $true
     $script:mode = $mode
-    $script:backupDir = if ($mode -eq 'fix') {
+    $script:backupDir = if ($mode -ne 'scan') {
         Join-Path ([Environment]::GetFolderPath('Desktop')) "Thunderbird-Fix-Backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')" }
     $script:sync = [hashtable]::Synchronized(@{
         Queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
-        Progress = 0; StatusText = ''; Done = $false; Results = $null; TbRunning = $false })
+        Progress = 0; StatusText = ''; Done = $false; Results = $null; TbRunning = $false
+        OptDone = $false; OptSaved = [int64]0; OptWarn = 0 })
     $opt = @{ Mode = $mode; Targets = @($keys); IsAdmin = $isAdmin; BackupDir = $script:backupDir
-              RebuildIndex = [bool]$tglIndex.Tag; ClearCache = [bool]$tglCache.Tag; Defender = [bool]$tglDef.Tag }
+              RebuildIndex = [bool]$tglIndex.Tag; Defender = [bool]$tglDef.Tag }
     $script:ps = [PowerShell]::Create()
     [void]$script:ps.AddScript($engine).AddArgument($script:sync).AddArgument($opt)
     [void]$script:ps.BeginInvoke()
@@ -733,7 +900,7 @@ function Start-Fix($keys) {
 
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 120
-$timer.Add_Tick({
+$timer.Add_Tick({ try {
     $item = $null
     while ($script:sync.Queue.TryDequeue([ref]$item)) { Add-LogLine $item[0] $item[1] }
     $pct = [math]::Min(100, [math]::Max(0, $script:sync.Progress))
@@ -761,12 +928,28 @@ $timer.Add_Tick({
             [Windows.Forms.MessageBox]::Show("แก้ไขเรียบร้อยทั้ง $ok บัญชี`r`n`r`nเปิด Thunderbird แล้วลองใช้งาน หากยังพบปัญหาในโฟลเดอร์ใด ให้คลิกขวาที่โฟลเดอร์ > Properties > Repair Folder",
                 'Thunderbird Fix', 'OK', 'Information') | Out-Null
         }
+    } elseif ($script:mode -eq 'optimize') {
+        $btnBackup.Enabled = $true
+        $mb  = [math]::Round([math]::Max(0, $script:sync.OptSaved) / 1MB, 1)
+        $nW  = $script:sync.OptWarn
+        if (-not $script:sync.OptDone) {
+            $lblStatus.Text = 'Optimize ไม่สำเร็จ - ปิด Thunderbird ไม่ได้ (ดูบันทึกการทำงาน)'; $lblStatus.ForeColor = $C.Red
+        } elseif ($nW) {
+            $lblStatus.Text = "Optimize เสร็จ  •  ลดขนาดได้ $mb MB  •  มี $nW รายการควรตรวจสอบ (บรรทัดสีเหลืองในบันทึก)"; $lblStatus.ForeColor = $C.Amber
+        } else {
+            $lblStatus.Text = "Optimize เสร็จเรียบร้อย  •  ลดขนาดฐานข้อมูลได้ $mb MB"; $lblStatus.ForeColor = $C.Green
+        }
+        [Windows.Forms.MessageBox]::Show($lblStatus.Text, 'Thunderbird Fix', 'OK', $(if ($script:sync.OptDone -and -not $nW) { 'Information' } else { 'Warning' })) | Out-Null
     } else {
         if ($nProb) { $lblStatus.Text = "สแกนเสร็จ  •  พบ $nProb บัญชีที่มีปัญหา - กด ""แก้ไขอัตโนมัติ"" เพื่อแก้ไข"; $lblStatus.ForeColor = $C.Red }
         else        { $lblStatus.Text = 'สแกนเสร็จ  •  ไม่พบบัญชีที่มีปัญหา'; $lblStatus.ForeColor = $C.Green }
         if ($script:sync.TbRunning) { $lblStatus.Text += '   (Thunderbird เปิดอยู่ จึงข้ามการตรวจไฟล์ถูกล็อก)' }
     }
-})
+} catch {
+    # never leave the window stuck in "busy" because of a display error
+    $timer.Stop(); Set-Busy $false
+    $lblStatus.Text = "เกิดข้อผิดพลาดในการแสดงผล: $($_.Exception.Message)"; $lblStatus.ForeColor = $C.Red
+} })
 
 $lv.Add_SelectedIndexChanged({ if ($lv.SelectedItems.Count) { Show-Details $lv.SelectedItems[0].Tag } })
 $lnkAll.Add_LinkClicked({ foreach ($i in $lv.Items) { $i.Checked = $true } })
@@ -785,6 +968,20 @@ $btnFixSel.Add_Click({
         [Windows.Forms.MessageBox]::Show('กรุณาติ๊กเลือกบัญชีที่ต้องการแก้ไขก่อน', 'Thunderbird Fix', 'OK', 'Information') | Out-Null; return }
     Start-Fix $keys
 })
+$btnOpt.Add_Click({
+    $a = [Windows.Forms.MessageBox]::Show(
+        "Optimize จะปิด Thunderbird แล้วทำสิ่งต่อไปนี้กับทุกโปรไฟล์:`r`n`r`n" +
+        "•  ตรวจความเสียหายและบีบอัดฐานข้อมูล (SQLite)`r`n" +
+        "•  ซ่อมไฟล์ตั้งค่าที่เสีย (Thunderbird จะสร้างใหม่)`r`n" +
+        "•  ล้างแคชและไฟล์ชั่วคราว`r`n" +
+        "•  เปิด Auto-Compact ให้บีบอัดโฟลเดอร์อัตโนมัติ`r`n" +
+        "•  แจ้งเตือนโฟลเดอร์ Trash / Junk ที่ใหญ่เกินไป`r`n`r`n" +
+        "ไม่มีการลบอีเมล ไฟล์ที่นำออกจะเก็บไว้ในโฟลเดอร์สำรองบน Desktop`r`n`r`nดำเนินการต่อหรือไม่?",
+        'Thunderbird Fix - Optimize', 'YesNo', 'Question')
+    if ($a -ne 'Yes') { return }
+    $script:fixedKeys = @(); $log.Clear()
+    Start-Engine 'optimize' @()
+})
 $btnBackup.Add_Click({ if ($script:backupDir -and (Test-Path $script:backupDir)) { Start-Process explorer.exe $script:backupDir } })
 $btnTB.Add_Click({
     if ($tbExe) { Start-Process $tbExe } else { [Windows.Forms.MessageBox]::Show('ไม่พบ thunderbird.exe', 'Thunderbird Fix') | Out-Null }
@@ -798,3 +995,4 @@ $form.Add_FormClosing({
 })
 
 [void]$form.ShowDialog()
+$mutex.ReleaseMutex(); $mutex.Dispose()

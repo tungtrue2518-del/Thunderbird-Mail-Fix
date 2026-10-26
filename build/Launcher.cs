@@ -13,8 +13,10 @@ using System.Management.Automation.Runspaces;
 [assembly: AssemblyTitle("Thunderbird Mail Fix")]
 [assembly: AssemblyProduct("Thunderbird Mail Fix")]
 [assembly: AssemblyDescription("Scan and fix Mozilla Thunderbird mail accounts")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+// __VERSION__ is filled in by build.ps1 from $AppVersion in Thunderbird-Fix-Tool.ps1
+[assembly: AssemblyVersion("__VERSION__.0")]
+[assembly: AssemblyFileVersion("__VERSION__.0")]
+[assembly: AssemblyInformationalVersion("__VERSION__")]
 
 static class Program
 {
