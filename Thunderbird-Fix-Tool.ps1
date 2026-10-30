@@ -36,7 +36,7 @@ if (-not $isAdmin -and $PSCommandPath) {
     } catch { }   # user pressed "No" on UAC - continue without admin
 }
 
-$AppVersion = '1.1.0'
+$AppVersion = '1.2.0'
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -178,7 +178,10 @@ $engine = {
             $list += [pscustomobject]@{
                 Key = "$($pr.Path)|$srv"; ServerKey = $srv; RawType = $type; Email = $email; Server = $hostName
                 Type = @{ imap = 'IMAP'; pop3 = 'POP3'; none = 'Local Folders'; movemail = 'Movemail' }[$type]
-                Dir = $dir; Profile = $pr; Port = [int]$port; SmtpHost = $smtpHost; SmtpPort = [int]$smtpPort
+                Dir = $dir; Profile = $pr; Port = [int]$port; SmtpHost = $smtpHost; SmtpPort = [int]$smtpPort; Ssl = $ssl
+                UserName = $p["mail.server.$srv.userName"]; SocketType = $p["mail.server.$srv.socketType"]
+                LeaveOnServer = ($p["mail.server.$srv.leave_on_server"] -eq 'true')
+                GlobalInbox = [bool]$p["mail.server.$srv.deferred_to_account"]
                 CheckNewOff = ($p["mail.server.$srv.check_new_mail"] -eq 'false')
                 OAuth = ($p["mail.server.$srv.authMethod"] -eq '10')
                 HasPassword = ($scheme -and $hostName -and ($saved -contains "${scheme}://$($hostName.ToLower())")) }
@@ -204,6 +207,182 @@ $engine = {
             } catch { $res = 'port' } finally { $tcp.Close() }
         }
         $netCache[$k] = $res; $res
+    }
+
+    # Talks to a POP3 server like Thunderbird does: TLS handshake (port 995) + "+OK" greeting.
+    # Returns 'ok', 'cert:<reason>', 'noreply' or 'port'. Certificate problems make Thunderbird refuse to download.
+    $popCache = @{}
+    function Test-Pop3($hostName, $port, $ssl) {
+        $k = "${hostName}:$port"
+        if ($popCache.ContainsKey($k)) { return $popCache[$k] }
+        $res = 'noreply'
+        $tcp = New-Object Net.Sockets.TcpClient
+        try {
+            $ar = $tcp.BeginConnect($hostName, $port, $null, $null)
+            if (-not ($ar.AsyncWaitHandle.WaitOne(5000) -and $tcp.Connected)) { $res = 'port' }
+            else {
+                $tcp.ReceiveTimeout = 8000; $tcp.SendTimeout = 8000
+                $stream = $tcp.GetStream()
+                if ($ssl) {
+                    $script:certErr = 'None'
+                    $cb = [Net.Security.RemoteCertificateValidationCallback] { param($s, $cert, $chain, $err) $script:certErr = [string]$err; $true }
+                    $tls = New-Object Net.Security.SslStream($stream, $false, $cb)
+                    $tls.AuthenticateAsClient($hostName)
+                    $stream = $tls
+                }
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::ASCII)
+                $greeting = $reader.ReadLine()
+                if ($greeting -like '+OK*') {
+                    $res = 'ok'
+                    $w = New-Object IO.StreamWriter($stream, [Text.Encoding]::ASCII); $w.Write("QUIT`r`n"); $w.Flush()
+                }
+                if ($ssl -and $script:certErr -ne 'None') {
+                    $res = 'cert:' + $(switch -Wildcard ($script:certErr) {
+                        '*NameMismatch*' { 'ชื่อในใบรับรองไม่ตรงกับชื่อเซิร์ฟเวอร์' }
+                        '*ChainErrors*'  { 'ใบรับรองหมดอายุหรือไม่น่าเชื่อถือ' }
+                        default          { $script:certErr } })
+                }
+            }
+        } catch { if ($res -ne 'port') { $res = 'noreply' } }
+        finally { $tcp.Close() }
+        $popCache[$k] = $res; $res
+    }
+
+    # Logs in to a POP3 server with the password the user typed (kept in memory only, never logged),
+    # exactly like "Get Messages", and explains the server's answer.
+    function Test-Pop3Login($L) {
+        Log 'STEP' "ทดสอบรับเมล: $($L.UserName) @ $($L.Server):$($L.Port)"
+        $pw = $L.Password; $L.Password = $null
+        $result = @{ Ok = $false; Summary = ''; Text = '' }
+        $tcp = New-Object Net.Sockets.TcpClient
+        try {
+            $ar = $tcp.BeginConnect($L.Server, $L.Port, $null, $null)
+            if (-not ($ar.AsyncWaitHandle.WaitOne(8000) -and $tcp.Connected)) { throw 'CONNECT' }
+            $tcp.ReceiveTimeout = 15000; $tcp.SendTimeout = 15000
+            $stream = $tcp.GetStream()
+            $open = {
+                param($s)
+                $script:popR = New-Object IO.StreamReader($s, [Text.Encoding]::ASCII)
+                $script:popW = New-Object IO.StreamWriter($s, [Text.Encoding]::ASCII); $script:popW.NewLine = "`r`n"
+            }
+            if ($L.SocketType -eq '3') { $tls = New-Object Net.Security.SslStream($stream, $false, { $true }); $tls.AuthenticateAsClient($L.Server); $stream = $tls }
+            & $open $stream
+            $send = { param($cmd) $script:popW.WriteLine($cmd); $script:popW.Flush(); $script:popR.ReadLine() }
+            $greet = $script:popR.ReadLine()
+            if ($greet -notlike '+OK*') { throw "GREETING:$greet" }
+            if ($L.SocketType -eq '2') {   # STARTTLS
+                if ((& $send 'STLS') -notlike '+OK*') { throw 'STLS' }
+                $tls = New-Object Net.Security.SslStream($stream, $false, { $true }); $tls.AuthenticateAsClient($L.Server); & $open $tls
+            }
+            $r = & $send "USER $($L.UserName)"
+            if ($r -like '+OK*') { $r = & $send "PASS $pw" }
+            $pw = $null
+            if ($r -notlike '+OK*') { throw "LOGIN:$r" }
+            $stat = & $send 'STAT'
+            [void](& $send 'QUIT')
+            $count = 0; $bytes = [int64]0
+            if ($stat -match '^\+OK\s+(\d+)\s+(\d+)') { $count = [int]$Matches[1]; $bytes = [int64]$Matches[2] }
+            $result.Ok = $true
+            $result.Summary = "ล็อกอินสำเร็จ - บนเซิร์ฟเวอร์มีเมล $count ฉบับ ($([math]::Round($bytes / 1MB, 1)) MB)"
+            Log 'OK' $result.Summary
+            $result.Text = "✔ $($result.Summary)`r`n`r`n" + $(if ($count -gt 0) {
+                "รหัสผ่านถูกต้องและเซิร์ฟเวอร์ใช้งานได้ ถ้า Thunderbird ยังกด Get Messages ไม่ได้:`r`n" +
+                "1. รหัสผ่านที่ Thunderbird จำไว้อาจเป็นรหัสเก่า - Settings > Privacy & Security > Saved Passwords > ลบรายการ mailbox://$($L.Server) แล้วกด Get Messages ใส่รหัสใหม่`r`n" +
+                "2. ตรวจว่า Thunderbird ไม่ได้อยู่ในโหมด Work Offline (File > Offline)`r`n" +
+                "3. กด แก้ไขอัตโนมัติ เพื่อซ่อมไฟล์สถานะ POP3 / กล่องจดหมาย"
+            } else {
+                "บนเซิร์ฟเวอร์ไม่มีเมลรอดาวน์โหลด ถ้าลูกค้าส่งมาแล้วแต่ไม่มีบนเซิร์ฟเวอร์:`r`n" +
+                "•  อาจมีเครื่องอื่น/มือถือดึงเมลไปก่อนแล้ว`r`n•  อาจตก Spam บนเซิร์ฟเวอร์ (ดูใน Webmail)`r`n•  เมลอาจส่งไม่ถึง - ขอให้ลูกค้าส่งเมลตีกลับ (bounce) มาให้ดู"
+            })
+        }
+        catch {
+            $err  = "$($_.Exception.Message)" -replace '^Exception calling .*?: ', ''
+            $code = if ($err -match '^(CONNECT|GREETING|STLS|LOGIN)') { $Matches[1] } else { 'EX' }
+            $serverSaid = if ($err -match '^(LOGIN|GREETING):(.*)$') { $Matches[2].Trim() } else { $err }
+            $why = switch ($code) {
+                'CONNECT'  { "เชื่อมต่อเซิร์ฟเวอร์ $($L.Server):$($L.Port) ไม่ได้ - ตรวจอินเทอร์เน็ต / Firewall / Antivirus" }
+                'GREETING' { 'เซิร์ฟเวอร์ไม่ตอบแบบ POP3 - ตรวจพอร์ตและการเข้ารหัส (SSL) ใน Server Settings' }
+                'STLS'     { 'เซิร์ฟเวอร์ไม่รองรับ STARTTLS - เปลี่ยน Connection security เป็น SSL/TLS พอร์ต 995' }
+                'LOGIN'    {   # classify by what the server itself said
+                    switch -Regex ($serverSaid) {
+                        'IN-USE|lock|in use|busy' { 'กล่องเมลถูกเปิดใช้งานอยู่โดยเครื่องอื่น (POP3 ให้เข้าได้ทีละเครื่อง) - ปิด Thunderbird / Outlook / มือถือเครื่องอื่นที่ใช้บัญชีนี้ รอ 5-10 นาทีแล้วลองใหม่'; break }
+                        'SYS|temp|quota|full'     { 'เซิร์ฟเวอร์เมลมีปัญหาชั่วคราวหรือพื้นที่เต็ม - ติดต่อผู้ดูแลเมลเซิร์ฟเวอร์'; break }
+                        default                   { 'รหัสผ่านหรือชื่อผู้ใช้ไม่ถูกต้อง หรือบัญชีถูกระงับ - ตรวจรหัสผ่านกับผู้ดูแลเมลเซิร์ฟเวอร์ แล้วอัปเดตใน Thunderbird (Settings > Privacy & Security > Saved Passwords)' }
+                    }
+                }
+                default {
+                    if ($err -match 'timed out|time out|period of time') { 'เซิร์ฟเวอร์ไม่ตอบกลับภายในเวลาที่กำหนด - ลองใหม่อีกครั้ง หรือตรวจ Firewall' }
+                    elseif ($err -match 'certificate|SSL|TLS|authentication') { 'เชื่อมต่อแบบเข้ารหัส (SSL) ไม่สำเร็จ - ตรวจ Connection security / พอร์ตใน Server Settings' }
+                    else { 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ' }
+                }
+            }
+            $result.Summary = "รับเมลไม่ได้ - $why"
+            $result.Text = "✖ $why`r`n`r`nข้อความจากเซิร์ฟเวอร์: $serverSaid"
+            Log 'ERR' "$why  (เซิร์ฟเวอร์ตอบ: $serverSaid)"
+        }
+        finally { $pw = $null; $tcp.Close() }
+        $sync.LoginResult = $result
+    }
+
+    # popstate.dat remembers which POP3 messages were already downloaded; when it is damaged
+    # Thunderbird can skip new mail. Valid lines: comments, "*host user", "k|d|f|b <uidl> <time>".
+    function Test-PopState($dir) {
+        $f = Join-Path $dir 'popstate.dat'
+        if (-not (Test-Path -LiteralPath $f)) { return $true }
+        try { $lines = [IO.File]::ReadAllLines($f) } catch { return $false }
+        if (-not $lines -or $lines[0] -notlike '# POP3 State File*') { return $false }
+        foreach ($l in $lines) { if ($l -and $l -notmatch '^(#|\*\S+ |[kdfb] \S+ \d+)') { return $false } }
+        $true
+    }
+
+    # Enabled message filters that delete mail, move it away or mark it as junk
+    function Get-RiskyFilters($dir) {
+        $f = Join-Path $dir 'msgFilterRules.dat'
+        if (-not (Test-Path -LiteralPath $f)) { return @() }
+        $filters = @(); $cur = $null
+        foreach ($l in Get-Content -LiteralPath $f -Encoding UTF8 -ErrorAction SilentlyContinue) {
+            if ($l -notmatch '^(\w+)="(.*)"$') { continue }
+            $key = $Matches[1]; $val = $Matches[2]
+            switch ($key) {
+                'name'        { $cur = @{ Name = $val; Enabled = $false; Actions = @() }; $filters += $cur }
+                'enabled'     { if ($cur) { $cur.Enabled = ($val -eq 'yes') } }
+                'action'      { if ($cur) { $cur.Actions += @{ Type = $val; Value = '' } } }
+                'actionValue' { if ($cur -and $cur.Actions) { $cur.Actions[-1].Value = $val } }
+            }
+        }
+        foreach ($flt in $filters | Where-Object { $_.Enabled }) {
+            $what = foreach ($a in $flt.Actions) {
+                switch ($a.Type) {
+                    'Delete'                 { 'ลบเมล' }
+                    'Delete from Pop3 server' { 'ลบจากเซิร์ฟเวอร์' }
+                    'JunkScore'              { if ($a.Value -eq '100') { 'ส่งเข้า Junk' } }
+                    'Move to folder'         { 'ย้ายไป ' + [Uri]::UnescapeDataString(($a.Value -split '/')[-1]) }
+                }
+            }
+            if ($what) { "$($flt.Name) ($(@($what) -join ', '))" }
+        }
+    }
+
+    # Live (not deleted) messages that arrived in the last $days days. Only the end of the file
+    # is read: new mail is appended, so big folders stay fast.
+    function Get-RecentMailCount($file, $days) {
+        $fi = Get-Item -LiteralPath $file -ErrorAction SilentlyContinue
+        if (-not $fi -or $fi.Length -eq 0 -or $fi.LastWriteTime -lt (Get-Date).AddDays(-$days)) { return 0 }
+        $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+        try {
+            [void]$fs.Seek([math]::Max(0, $fs.Length - 20MB), 'Begin')
+            $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::GetEncoding(28591))).ReadToEnd()
+        } finally { $fs.Close() }
+        $since = (Get-Date).AddDays(-$days); $n = 0; $recent = $false; $dated = $false
+        foreach ($m in [regex]::Matches($text, '(?m)^(?:From - (?<d>[^\r\n]+)|X-Mozilla-Status: (?<s>[0-9a-fA-F]{4}))')) {
+            if ($m.Groups['d'].Success) {
+                $when = [datetime]::MinValue
+                $dated = [datetime]::TryParseExact(($m.Groups['d'].Value -replace '\s+', ' ').Trim(), 'ddd MMM d HH:mm:ss yyyy',
+                    [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$when)
+                $recent = (-not $dated) -or $when -ge $since
+            } elseif ($recent -and -not ([Convert]::ToInt32($m.Groups['s'].Value, 16) -band 0x8)) { $n++; $recent = $false }
+        }
+        $n
     }
 
     # Messages waiting in Local Folders > Outbox ("Unsent Messages"), ignoring ones flagged deleted
@@ -290,10 +469,47 @@ $engine = {
         if ($acc.CheckNewOff) {
             $issues += New-Issue 'NOCHECK' 'ปิดการตรวจเมลใหม่อัตโนมัติไว้ (เมลจะไม่เข้าเอง)' $true
         }
+        $inOk = $false
         if ($acc.Server -and $acc.Port) {
             switch (Test-Server $acc.Server $acc.Port) {
                 'dns'  { $issues += New-Issue 'NET_IN' "หาเซิร์ฟเวอร์รับเมล $($acc.Server) ไม่เจอ (DNS) - ตรวจอินเทอร์เน็ต / ชื่อเซิร์ฟเวอร์" $false }
                 'port' { $issues += New-Issue 'NET_IN' "เชื่อมต่อเซิร์ฟเวอร์รับเมล $($acc.Server):$($acc.Port) ไม่ได้ - ตรวจอินเทอร์เน็ต / Firewall / Antivirus" $false }
+                'ok'   { $inOk = $true }
+            }
+        }
+
+        # POP3: how mail is fetched and where it ends up
+        if ($acc.RawType -eq 'pop3') {
+            if ($inOk) {
+                $pop = Test-Pop3 $acc.Server $acc.Port $acc.Ssl
+                if ($pop -like 'cert:*') {
+                    $issues += New-Issue 'POP_CERT' "ใบรับรอง SSL ของเซิร์ฟเวอร์ $($acc.Server) มีปัญหา: $($pop.Substring(5)) - Thunderbird อาจปฏิเสธการรับเมล (ตรวจที่ Settings > Certificates หรือติดต่อผู้ดูแลเมลเซิร์ฟเวอร์)" $false
+                } elseif ($pop -ne 'ok') {
+                    $issues += New-Issue 'POP_REPLY' "เซิร์ฟเวอร์ $($acc.Server):$($acc.Port) ไม่ตอบแบบ POP3 - ตรวจพอร์ต / การเข้ารหัส (SSL) ใน Server Settings" $false
+                }
+            }
+            if ($dir -and (Test-Path -LiteralPath $dir) -and -not (Test-PopState $dir)) {
+                $issues += New-Issue 'POPSTATE' 'ไฟล์สถานะ POP3 (popstate.dat) เสีย - Thunderbird อาจข้ามเมลใหม่ไม่ดาวน์โหลด' $true
+            }
+            if (-not $acc.LeaveOnServer) {
+                $issues += New-Issue 'POP_LEAVE' 'POP3 ลบเมลออกจากเซิร์ฟเวอร์หลังดาวน์โหลด - ถ้ามีเครื่องอื่น/มือถือใช้บัญชีนี้ด้วย เครื่องที่ดึงก่อนจะได้เมลไปเครื่องเดียว (ติ๊ก "Leave messages on server" ทุกเครื่อง)' $false
+            }
+            if ($acc.GlobalInbox) {
+                $issues += New-Issue 'GLOBAL_INBOX' 'เมลของบัญชีนี้ถูกเก็บรวมไว้ที่ Local Folders > Inbox (Global Inbox) - ให้หาเมลที่นั่น' $false
+            }
+        }
+
+        # Mail that arrived but is not in the Inbox: filters and Junk
+        if ($dir -and (Test-Path -LiteralPath $dir)) {
+            $risky = @(Get-RiskyFilters $dir)
+            if ($risky) {
+                $issues += New-Issue 'FILTER' "มี Filter ที่ย้าย/ลบเมลอัตโนมัติ $($risky.Count) กฎ: $(($risky | Select-Object -First 3) -join ', ')$(if ($risky.Count -gt 3) { ', ...' }) - ตรวจที่ Tools > Message Filters" $false
+            }
+            foreach ($jf in @(Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -in 'Junk', 'Spam' })) {
+                $nJunk = Get-RecentMailCount $jf.FullName 14
+                if ($nJunk) {
+                    $issues += New-Issue 'JUNK' "มีเมล $nJunk ฉบับเข้าโฟลเดอร์ $($jf.Name) ใน 14 วันล่าสุด - เมลลูกค้าอาจอยู่ในนี้ (คลิกขวาที่เมล > Mark > As Not Junk)" $false
+                }
             }
         }
         if ($acc.SmtpHost -and $acc.SmtpPort) {
@@ -327,6 +543,7 @@ $engine = {
                   elseif ($issues.Count) { 'warn' } else { 'ok' }
         [pscustomobject]@{
             Key = $acc.Key; Email = $acc.Email; Type = $acc.Type; Server = $acc.Server; Dir = $dir
+            RawType = $acc.RawType; Port = $acc.Port; SocketType = $acc.SocketType; UserName = $acc.UserName
             User = $acc.Profile.User; ProfilePath = $acc.Profile.Path; Size = $size; Issues = $issues; Status = $status }
     }
 
@@ -342,6 +559,11 @@ $engine = {
         if (-not $dir -or -not (Test-Path -LiteralPath $dir)) {
             Log 'WARN' "ไม่พบโฟลเดอร์ $dir - แก้อัตโนมัติไม่ได้ ให้ตั้งค่า Local Directory ใหม่ใน Account Settings > Server Settings"
             return
+        }
+        if ($acc.RawType -eq 'pop3' -and -not (Test-PopState $dir)) {
+            if (Move-ToBackup (Join-Path $dir 'popstate.dat') $acc.Profile.Path) {
+                Log 'OK' "รีเซ็ตไฟล์สถานะ POP3 (popstate.dat) แล้ว$(if ($acc.LeaveOnServer) { ' - ครั้งแรกอาจดาวน์โหลดเมลที่ค้างบนเซิร์ฟเวอร์ซ้ำ' })"
+            }
         }
         $files = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue)
 
@@ -525,6 +747,7 @@ $engine = {
     }
 
     try {
+        if ($opt.Mode -eq 'login') { Test-Pop3Login $opt.Login; return }
         $tbRunning = [bool](Get-Process thunderbird -ErrorAction SilentlyContinue)
         Prog 3 'กำลังค้นหาโปรไฟล์ Thunderbird...'
         $profiles = @(Get-TbProfiles)   # @() - a single PSCustomObject has no .Count in PowerShell 5.1
@@ -770,6 +993,9 @@ $track.Controls.Add($fill); $form.Controls.Add($track)
 
 # --- Details + log --------------------------------------------------------------
 $detCard = New-Card $form 24 552 466 150 'รายละเอียดบัญชี'
+$btnLogin = New-Btn $detCard 'ทดสอบรับเมล' (466 - 18 - 118) 8 118 28
+$btnLogin.Font = F 9.5 'Bold'; $btnLogin.ForeColor = $C.Accent; $btnLogin.Enabled = $false
+$tt.SetToolTip($btnLogin, 'ล็อกอินเข้าเซิร์ฟเวอร์ POP3 แบบเดียวกับปุ่ม Get Messages เพื่อหาสาเหตุที่รับเมลไม่ได้ (ไม่บันทึกรหัสผ่าน)')
 $det = New-Object Windows.Forms.RichTextBox
 $det.SetBounds(18, 40, 436, 104); $det.BorderStyle = 'None'; $det.ReadOnly = $true; $det.BackColor = 'White'
 $det.Font = F 9.5; $det.ForeColor = $C.Muted; $det.Text = 'คลิกที่บัญชีในรายการเพื่อดูรายละเอียด'
@@ -820,6 +1046,7 @@ function Add-Det($text, $color, $font, $symbol) {
 }
 
 function Show-Details($r) {
+    $btnLogin.Enabled = [bool]($r -and $r.RawType -eq 'pop3' -and -not $script:busy)
     $det.Clear()
     if (-not $r) { $det.SelectionColor = $C.Muted; $det.AppendText('คลิกที่บัญชีในรายการเพื่อดูรายละเอียด'); return }
     Add-Det $r.Email $C.Text (F 10.5 'Bold')
@@ -863,28 +1090,52 @@ function Update-AccountList {
 }
 
 function Set-Busy([bool]$busy) {
+    $script:busy = $busy
     foreach ($b in $btnScan, $btnFixSel, $btnFixAll, $btnOpt) { $b.Enabled = -not $busy }
+    $btnLogin.Enabled = [bool]((-not $busy) -and $lv.SelectedItems.Count -and $lv.SelectedItems[0].Tag.RawType -eq 'pop3')
     $btnFixAll.BackColor = if ($busy) { $C.AccentSoft } else { $C.Accent }
     $btnOpt.BackColor    = if ($busy) { Hex '#99C9C4' } else { Hex '#0F766E' }
     $lv.Enabled = -not $busy
     $form.Cursor = if ($busy) { 'AppStarting' } else { 'Default' }
 }
 
-function Start-Engine($mode, $keys) {
+function Start-Engine($mode, $keys, $login) {
     Set-Busy $true
     $script:mode = $mode
-    $script:backupDir = if ($mode -ne 'scan') {
+    $script:backupDir = if ($mode -in 'fix', 'optimize') {
         Join-Path ([Environment]::GetFolderPath('Desktop')) "Thunderbird-Fix-Backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')" }
     $script:sync = [hashtable]::Synchronized(@{
         Queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
         Progress = 0; StatusText = ''; Done = $false; Results = $null; TbRunning = $false
-        OptDone = $false; OptSaved = [int64]0; OptWarn = 0 })
-    $opt = @{ Mode = $mode; Targets = @($keys); IsAdmin = $isAdmin; BackupDir = $script:backupDir
+        OptDone = $false; OptSaved = [int64]0; OptWarn = 0; LoginResult = $null })
+    $opt = @{ Mode = $mode; Targets = @($keys); IsAdmin = $isAdmin; BackupDir = $script:backupDir; Login = $login
               RebuildIndex = [bool]$tglIndex.Tag; Defender = [bool]$tglDef.Tag }
     $script:ps = [PowerShell]::Create()
     [void]$script:ps.AddScript($engine).AddArgument($script:sync).AddArgument($opt)
     [void]$script:ps.BeginInvoke()
     $timer.Start()
+}
+
+# Small password prompt for the login test - the password only lives in memory for this one test
+function Read-Password($r) {
+    $d = New-Object Windows.Forms.Form
+    $d.Text = 'ทดสอบการรับเมล'; $d.ClientSize = New-Object Drawing.Size(420, 196)
+    $d.FormBorderStyle = 'FixedDialog'; $d.StartPosition = 'CenterParent'; $d.MinimizeBox = $false; $d.MaximizeBox = $false
+    $d.BackColor = 'White'; $d.Font = F 9.5; $d.Icon = $form.Icon
+    New-Label $d $r.Email 20 16 (F 11 'Bold') $C.Text | Out-Null
+    New-Label $d "ผู้ใช้: $($r.UserName)   •   เซิร์ฟเวอร์: $($r.Server):$($r.Port)$(if ($r.SocketType -eq '3') { ' (SSL)' })" 20 44 (F 9) $C.Muted | Out-Null
+    New-Label $d 'ใส่รหัสผ่านของบัญชีนี้ เพื่อทดสอบล็อกอินแบบเดียวกับ Get Messages' 20 74 (F 9.5) $C.Text | Out-Null
+    $tb = New-Object Windows.Forms.TextBox
+    $tb.SetBounds(20, 100, 380, 28); $tb.UseSystemPasswordChar = $true; $tb.Font = F 11
+    $d.Controls.Add($tb)
+    New-Label $d 'ไม่มีการบันทึกรหัสผ่าน ใช้ทดสอบครั้งนี้ครั้งเดียว' 20 134 (F 8.5) $C.Muted | Out-Null
+    $ok = New-Btn $d 'ทดสอบ' 214 152 90 32 -Primary
+    $cancel = New-Btn $d 'ยกเลิก' 310 152 90 32
+    $ok.DialogResult = 'OK'; $cancel.DialogResult = 'Cancel'
+    $d.AcceptButton = $ok; $d.CancelButton = $cancel
+    $pw = if ($d.ShowDialog($form) -eq 'OK' -and $tb.Text) { $tb.Text } else { $null }
+    $tb.Clear(); $d.Dispose()
+    $pw
 }
 
 function Start-Fix($keys) {
@@ -909,6 +1160,16 @@ $timer.Add_Tick({ try {
     if (-not ($script:sync.Done -and $script:sync.Queue.IsEmpty)) { return }
 
     $timer.Stop(); $script:ps.Dispose()
+
+    if ($script:mode -eq 'login') {   # login test leaves the account list as it is
+        Set-Busy $false
+        $lr = $script:sync.LoginResult
+        if ($lr) {
+            $lblStatus.Text = "$($script:loginEmail): $($lr.Summary)"; $lblStatus.ForeColor = $(if ($lr.Ok) { $C.Green } else { $C.Red })
+            [Windows.Forms.MessageBox]::Show($lr.Text, "ทดสอบรับเมล - $($script:loginEmail)", 'OK', $(if ($lr.Ok) { 'Information' } else { 'Error' })) | Out-Null
+        }
+        return
+    }
     $script:results = @($script:sync.Results | Where-Object { $_ })
     Update-AccountList
     Set-Busy $false
@@ -981,6 +1242,15 @@ $btnOpt.Add_Click({
     if ($a -ne 'Yes') { return }
     $script:fixedKeys = @(); $log.Clear()
     Start-Engine 'optimize' @()
+})
+$btnLogin.Add_Click({
+    if (-not $lv.SelectedItems.Count) { return }
+    $r = $lv.SelectedItems[0].Tag
+    $pw = Read-Password $r
+    if (-not $pw) { return }
+    $script:loginEmail = $r.Email
+    Start-Engine 'login' @() @{ Server = $r.Server; Port = $r.Port; SocketType = $r.SocketType; UserName = $r.UserName; Password = $pw }
+    $pw = $null
 })
 $btnBackup.Add_Click({ if ($script:backupDir -and (Test-Path $script:backupDir)) { Start-Process explorer.exe $script:backupDir } })
 $btnTB.Add_Click({
