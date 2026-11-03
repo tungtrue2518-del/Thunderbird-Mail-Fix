@@ -28,33 +28,92 @@
 # --- Self-elevate to Administrator ----------------------------------------------
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $isAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin -and $PSCommandPath) {
+
+# An elevated process cannot see mapped network drives (Z:) or SUBST drives of the normal user,
+# so relaunch with the real path: \\server\share\... or the folder behind the SUBST letter.
+function Resolve-RealPath([string]$path) {
+    if (-not $path -or $path -like '\\*') { return $path }
+    $drive = $path.Substring(0, 2)
     try {
-        Start-Process powershell.exe -Verb RunAs -ErrorAction Stop -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"")
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction Stop
+        if ($disk.DriveType -eq 4 -and $disk.ProviderName) { return $disk.ProviderName.TrimEnd('\') + $path.Substring(2) }
+    } catch {}
+    foreach ($line in @(& subst.exe 2>$null)) {
+        if ($line -match "^$([regex]::Escape($drive))\\: => (.+)$") { return $Matches[1].TrimEnd('\') + $path.Substring(2) }
+    }
+    $path
+}
+# TBFIX_RELAUNCHED stops a relaunch loop; TBFIX_TEST_NO_RUNAS lets the dry test relaunch without a UAC prompt
+if (-not $isAdmin -and $PSCommandPath -and $env:TBFIX_RELAUNCHED -ne '1') {
+    try {
+        $env:TBFIX_RELAUNCHED = '1'
+        $relaunch = @{ FilePath = 'powershell.exe'; ErrorAction = 'Stop'; ArgumentList = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$(Resolve-RealPath $PSCommandPath)`"") }
+        if ($env:TBFIX_TEST_NO_RUNAS -ne '1') { $relaunch.Verb = 'RunAs' }
+        Start-Process @relaunch
         exit
-    } catch { }   # user pressed "No" on UAC - continue without admin
+    } catch { $env:TBFIX_RELAUNCHED = $null }   # user pressed "No" on UAC - continue without admin
 }
 
-$AppVersion = '1.2.0'
+$AppVersion = '1.2.1'
 
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# Only one copy at a time - two copies fixing the same profile would fight over the files
-$mutex = New-Object Threading.Mutex($false, 'ThunderbirdMailFix-SingleInstance')
-$ownsMutex = try { $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $true }
-if (-not $ownsMutex) {
-    [Windows.Forms.MessageBox]::Show('Thunderbird Mail Fix เปิดอยู่แล้ว', 'Thunderbird Mail Fix', 'OK', 'Information') | Out-Null
-    return
+# --- Only one copy at a time (two copies fixing the same profile would fight over the files) ---
+# Copies of this tool: the exe (whatever it was renamed to) or powershell running this script.
+function Get-OtherCopies {
+    $self = [Diagnostics.Process]::GetCurrentProcess()
+    $exeName = if ($self.ProcessName -notmatch '^powershell(_ise)?$') { "$($self.ProcessName).exe" }
+    @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessId -ne $PID -and $_.SessionId -eq $self.SessionId -and (
+            ($exeName -and $_.Name -eq $exeName) -or
+            ($_.Name -eq 'powershell.exe' -and $_.CommandLine -and
+             $(if ($_.CommandLine -match '-File\s+"([^"]+)"' -or $_.CommandLine -match '-File\s+(\S+)') { (Split-Path $Matches[1] -Leaf) -like 'Thunderbird-Fix-Tool*.ps1' })))
+    })
+}
+function Get-SingleInstance([int]$waitMs) {
+    try { $script:mutex.WaitOne($waitMs) } catch [Threading.AbandonedMutexException] { $true }   # old copy crashed: lock is ours
+}
+$mutexName = 'ThunderbirdMailFix-SingleInstance'
+try { $mutex = New-Object Threading.Mutex($false, $mutexName) }
+catch { $mutex = $null }   # access denied: a copy running as Administrator owns it
+if (-not $mutex -or -not (Get-SingleInstance 0)) {
+    $others = Get-OtherCopies
+    # an open window of this tool, however it was started (exe, script, renamed, as Administrator)
+    $mySession = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $win = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Id -ne $PID -and $_.SessionId -eq $mySession -and $_.MainWindowTitle -eq 'Thunderbird Mailbox Fix Tool' }) +
+        @($others | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue } |
+            Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }) | Select-Object -First 1
+    if ($win) {   # already open: bring that window to the front instead of opening a second one
+        try { [Microsoft.VisualBasic.Interaction]::AppActivate($win.Id) } catch {}
+        return
+    }
+    # a previous copy is stuck in the background (the old "restart the PC" case): offer to end it
+    $a = [Windows.Forms.MessageBox]::Show(
+        "Thunderbird Mail Fix ที่เปิดไว้ก่อนหน้ายังค้างอยู่เบื้องหลัง`r`n`r`nต้องการปิดตัวที่ค้างแล้วเปิดใหม่หรือไม่?",
+        'Thunderbird Mail Fix', 'YesNo', 'Question')
+    if ($a -ne 'Yes') { return }
+    foreach ($o in $others) { Stop-Process -Id $o.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 800
+    if (-not $mutex) { try { $mutex = New-Object Threading.Mutex($false, $mutexName) } catch { $mutex = $null } }
+    if (-not $mutex -or -not (Get-SingleInstance 5000)) {
+        [Windows.Forms.MessageBox]::Show(
+            "ปิดตัวที่ค้างไม่ได้ (อาจเปิดไว้ด้วยสิทธิ์ Administrator)`r`n`r`nเปิด Task Manager แล้วปิด ThunderbirdMailFix / Windows PowerShell จากนั้นเปิดโปรแกรมใหม่",
+            'Thunderbird Mail Fix', 'OK', 'Warning') | Out-Null
+        return
+    }
 }
 
-# Hide the black console window behind the GUI
-Add-Type -Name Win -Namespace Native -MemberDefinition @'
+# Hide the black console window behind the GUI (script mode only; never fatal)
+try {
+    Add-Type -Name Win -Namespace Native -ErrorAction Stop -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 '@
-[Native.Win]::ShowWindow([Native.Win]::GetConsoleWindow(), 0) | Out-Null
+    [Native.Win]::ShowWindow([Native.Win]::GetConsoleWindow(), 0) | Out-Null
+} catch {}
 
 # ================================================================================
 #  ENGINE  (runs in a background runspace so the window never freezes)
@@ -66,6 +125,7 @@ $engine = {
 
     $backupDir  = $opt.BackupDir
     $logFile    = if ($backupDir) { Join-Path $backupDir 'fix-log.txt' }
+    if ($backupDir) { New-Item -ItemType Directory -Force -Path $backupDir -ErrorAction SilentlyContinue | Out-Null }   # before the first log line
     $driveCache = @{}
     $RO_SYS     = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::System
 
@@ -89,12 +149,47 @@ $engine = {
     }
 
     # Every Thunderbird profile on the PC, with the SID of the Windows user who owns it
+    function New-TbProfile($user, $userDir, $sid, $path) {
+        [pscustomobject]@{
+            User = $user; UserDir = $userDir; Path = (Resolve-Path -LiteralPath $path).Path; OwnerSid = $sid
+            # who counts as "the user can write": owner, Everyone, Authenticated Users, Users
+            Sids = @($sid, 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') }
+    }
+
+    # Profile folders listed in <root>\profiles.ini; when the file is missing or lists nothing
+    # usable, fall back to every <root>\Profiles\* folder that has a prefs.js
+    function Get-ProfilePaths($tbRoot) {
+        $paths = @()
+        $ini = Join-Path $tbRoot 'profiles.ini'
+        if (Test-Path -LiteralPath $ini) {
+            $section = @{}
+            foreach ($line in @(Get-Content -LiteralPath $ini -ErrorAction SilentlyContinue) + '[end]') {
+                if ($line -match '^\s*\[') {
+                    if ($section.Path) {
+                        $p = [Environment]::ExpandEnvironmentVariables($section.Path.Trim()) -replace '/', '\'
+                        $paths += if ($section.IsRelative -ne '0') { Join-Path $tbRoot $p } else { $p }
+                    }
+                    $section = @{}
+                }
+                elseif ($line -match '^\s*(\w+)\s*=(.*)$') { $section[$Matches[1]] = $Matches[2].Trim() }
+            }
+        }
+        $paths = @($paths | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'prefs.js') })
+        if (-not $paths) {
+            $paths = @(Get-ChildItem -LiteralPath (Join-Path $tbRoot 'Profiles') -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'prefs.js') } | ForEach-Object { $_.FullName })
+        }
+        $paths
+    }
+
     function Get-TbProfiles {
         $sidByPath = @{}
         Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
             $p = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
-            if ($p) { $sidByPath[$p.ToLower()] = $_.PSChildName }
+            # values like %SystemDrive%\Users\somchai must be expanded or Test-Path never finds them
+            if ($p) { $sidByPath[[Environment]::ExpandEnvironmentVariables($p).ToLower()] = $_.PSChildName }
         }
+        $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         # every Windows profile folder (ProfileList also finds profiles that are not on C:)
         $userDirs = if ($opt.IsAdmin) {
             @($sidByPath.Keys | Where-Object { Test-Path $_ } | ForEach-Object { Get-Item $_ }) +
@@ -102,28 +197,19 @@ $engine = {
         } else { @(Get-Item $env:USERPROFILE) }
         $found = @()
         foreach ($u in $userDirs) {
-            $tbRoot = Join-Path $u.FullName 'AppData\Roaming\Thunderbird'
-            $ini    = Join-Path $tbRoot 'profiles.ini'
-            if (-not (Test-Path $ini)) { continue }
             $sid = $sidByPath[$u.FullName.ToLower()]
-            if (-not $sid) { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
-            $section = @{}
-            foreach ($line in @(Get-Content $ini) + '[end]') {
-                if ($line -match '^\[') {
-                    if ($section.Path) {
-                        $p    = $section.Path.Trim()
-                        $full = if ($section.IsRelative -ne '0') { Join-Path $tbRoot ($p -replace '/', '\') } else { $p }
-                        if (Test-Path $full) {
-                            $found += [pscustomobject]@{
-                                User = $u.Name; UserDir = $u.FullName; Path = (Resolve-Path $full).Path; OwnerSid = $sid
-                                # who counts as "the user can write": owner, Everyone, Authenticated Users, Users
-                                Sids = @($sid, 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') }
-                        }
-                    }
-                    $section = @{}
-                }
-                elseif ($line -match '^(\w+)=(.*)$') { $section[$Matches[1]] = $Matches[2] }
+            if (-not $sid) { $sid = $mySid }
+            # normal install + Microsoft Store install (keeps its AppData inside the app package)
+            $roots = @(Join-Path $u.FullName 'AppData\Roaming\Thunderbird') +
+                @(Get-ChildItem -LiteralPath (Join-Path $u.FullName 'AppData\Local\Packages') -Directory -Filter '*Thunderbird*' -ErrorAction SilentlyContinue |
+                    ForEach-Object { Join-Path $_.FullName 'LocalCache\Roaming\Thunderbird' })
+            foreach ($tbRoot in $roots | Where-Object { Test-Path -LiteralPath $_ }) {
+                foreach ($pp in Get-ProfilePaths $tbRoot) { $found += New-TbProfile $u.Name $u.FullName $sid $pp }
             }
+        }
+        # profiles the user picked by hand (Thunderbird Portable, profile on another drive...)
+        foreach ($extra in @($opt.ExtraProfiles | Where-Object { $_ })) {
+            if (Test-Path -LiteralPath (Join-Path $extra 'prefs.js')) { $found += New-TbProfile $env:USERNAME $env:USERPROFILE $mySid $extra }
         }
         @($found | Sort-Object Path -Unique)
     }
@@ -457,12 +543,21 @@ $engine = {
                     try { $fs = [IO.File]::Open($f.FullName, 'Open', 'ReadWrite', 'ReadWrite'); $fs.Close() }
                     catch { $locked += $f }
                 }
-                if ($locked) { $issues += New-Issue 'LOCKED' "กล่องจดหมายเปิดเขียนไม่ได้ (ถูกล็อก/ไม่มีสิทธิ์): $($locked.Count) ไฟล์ ($(Join-Names $locked))" $true }
+                if ($locked) {
+                    $by = @(Get-FileLockers @($locked | ForEach-Object { $_.FullName }) | ForEach-Object { $_.Name } | Sort-Object -Unique)
+                    $issues += New-Issue 'LOCKED' ("กล่องจดหมายเปิดเขียนไม่ได้ (ถูกล็อก/ไม่มีสิทธิ์): $($locked.Count) ไฟล์ ($(Join-Names $locked))" +
+                        $(if ($by) { " - ถูกเปิดค้างโดยโปรแกรม: $($by -join ', ')" })) $true
+                }
             }
 
             foreach ($b in @($mbox | Where-Object { $_.Length -gt 4GB })) {
                 $issues += New-Issue 'BIG' "กล่องจดหมาย '$($b.Name)' ใหญ่ $([math]::Round($b.Length / 1GB, 1)) GB - ควร Compact และย้ายอีเมลเก่าไป Archive" $false
             }
+        }
+
+        # Thunderbird stuck in the background on this profile
+        foreach ($s in @($stuckList | Where-Object { $_.Profile -eq $acc.Profile.Path })) {
+            $issues += New-Issue 'TB_STUCK' "Thunderbird ค้างอยู่เบื้องหลัง ($($s.Why), PID $($s.Id)) - ทำให้เปิด Thunderbird ไม่ขึ้น / รับเมลไม่ได้ กดแก้ไขอัตโนมัติเพื่อปิดให้ (ไม่ต้องรีสตาร์ทเครื่อง)" $true
         }
 
         # Receiving / sending: settings and network
@@ -592,10 +687,28 @@ $engine = {
         $code = $LASTEXITCODE
         if ($opt.IsAdmin -and $name) { & icacls.exe "$dir" /setowner "$name" /T /C /Q 2>&1 | Out-Null }
         if ($code -eq 0) { Log 'OK' 'รีเซ็ตสิทธิ์ Full Control เรียบร้อย' } else { Log 'WARN' "รีเซ็ตสิทธิ์ไม่สำเร็จบางไฟล์: $r" }
+
+        # mail files another program still holds open: end a leftover Thunderbird, name anything else
+        $held = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object {
+            $_.Extension -eq '' -and $(try { [IO.File]::Open($_.FullName, 'Open', 'ReadWrite', 'ReadWrite').Close(); $false } catch { $true }) })
+        if ($held) {
+            foreach ($l in Get-FileLockers @($held | ForEach-Object { $_.FullName })) {
+                if ($l.Name -eq 'thunderbird') { Stop-Process -Id $l.Id -Force -ErrorAction SilentlyContinue; Log 'OK' "ปิด Thunderbird ที่ค้างไฟล์อยู่ (PID $($l.Id))" }
+                else { Log 'WARN' "ไฟล์เมลถูกโปรแกรม $($l.Name) เปิดค้างอยู่ - ปิดโปรแกรมนั้น หรือรอสักครู่แล้วสแกนใหม่ (ไม่ต้องรีสตาร์ทเครื่อง)" }
+            }
+        }
     }
 
-    # Closes Thunderbird cleanly (it saves its files on exit); forces it only after 15 s
+    # Closes Thunderbird cleanly (it saves its files on exit); forces it only after 15 s.
+    # A Thunderbird that is stuck in the background (no window / not responding) is ended at once.
     function Stop-Thunderbird {
+        foreach ($s in @($stuckList)) {
+            if ($s.Id) {
+                Stop-Process -Id $s.Id -Force -ErrorAction SilentlyContinue
+                Log 'OK' "ปิด Thunderbird ที่ค้างอยู่เบื้องหลัง (PID $($s.Id)) - ไม่ต้องรีสตาร์ทเครื่อง"
+            }
+        }
+        if ($stuckList) { Start-Sleep -Milliseconds 800 }
         if (-not (Get-Process thunderbird -ErrorAction SilentlyContinue)) { return $true }
         $sync.StatusText = 'กำลังปิด Thunderbird...'
         Get-Process thunderbird -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
@@ -611,6 +724,72 @@ $engine = {
         }
         Log 'OK' 'ปิด Thunderbird แล้ว'
         $true
+    }
+
+    # --- Who is holding a file? (Windows Restart Manager - the same API the installer uses) ---
+    function Get-FileLockers([string[]]$files) {
+        if (-not $files) { return @() }
+        if (-not ('TbFix.RM' -as [type])) {
+            try {
+                Add-Type -ErrorAction Stop -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices;
+namespace TbFix {
+public static class RM {
+    [StructLayout(LayoutKind.Sequential)] struct UniqueProcess { public int Pid; public System.Runtime.InteropServices.ComTypes.FILETIME Start; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct ProcessInfo {
+        public UniqueProcess Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string AppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string ServiceName;
+        public int AppType; public uint Status; public uint Session; [MarshalAs(UnmanagedType.Bool)] public bool Restartable; }
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmStartSession(out uint h, int flags, string key);
+    [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint h);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmRegisterResources(uint h, uint nFiles, string[] files, uint nApps, UniqueProcess[] apps, uint nSvc, string[] svc);
+    [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint h, out uint needed, ref uint count, [In, Out] ProcessInfo[] info, ref uint reasons);
+    public static int[] Lockers(string[] files) {
+        var list = new List<int>(); uint h;
+        if (RmStartSession(out h, 0, Guid.NewGuid().ToString()) != 0) return list.ToArray();
+        try {
+            if (RmRegisterResources(h, (uint)files.Length, files, 0, null, 0, null) != 0) return list.ToArray();
+            uint needed, count = 0, reasons = 0;
+            if (RmGetList(h, out needed, ref count, null, ref reasons) == 234 && needed > 0) {
+                var info = new ProcessInfo[needed]; count = needed;
+                if (RmGetList(h, out needed, ref count, info, ref reasons) == 0)
+                    for (int i = 0; i < count; i++) list.Add(info[i].Process.Pid);
+            }
+        } finally { RmEndSession(h); }
+        return list.ToArray();
+    }
+}}
+'@
+            } catch { return @() }
+        }
+        @([TbFix.RM]::Lockers($files) | Sort-Object -Unique | ForEach-Object {
+            $p = Get-Process -Id $_ -ErrorAction SilentlyContinue
+            [pscustomobject]@{ Id = $_; Name = $(if ($p) { $p.ProcessName } else { "PID $_" }); Proc = $p }
+        })
+    }
+
+    # A Thunderbird that holds the profile lock but has no window or does not respond - the case
+    # that used to need a restart ("Thunderbird is already running", Get Messages does nothing).
+    function Get-StuckThunderbird($profiles) {
+        $mySession = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        $stuck = @()
+        foreach ($pr in $profiles) {
+            $lock = Join-Path $pr.Path 'parent.lock'
+            if (-not (Test-Path -LiteralPath $lock)) { continue }
+            try { $fs = [IO.File]::Open($lock, 'Open', 'ReadWrite', 'None'); $fs.Close(); continue } catch {}   # not held: fine
+            $tray = (Read-Prefs $pr.Path)['mail.minimizeToTray'] -eq 'true'   # minimized to tray = no window, but not stuck
+            foreach ($l in Get-FileLockers @($lock)) {
+                $p = $l.Proc
+                if ($p -and $p.SessionId -ne $mySession) { continue }   # another signed-in user's Thunderbird
+                $noWindow = $p -and $p.MainWindowHandle -eq [IntPtr]::Zero -and -not $tray -and $p.StartTime -lt (Get-Date).AddSeconds(-60)
+                $hung = $p -and $p.MainWindowHandle -ne [IntPtr]::Zero -and -not $p.Responding
+                if ($noWindow -or $hung) {
+                    $stuck += [pscustomobject]@{ Profile = $pr.Path; Id = $l.Id; Name = $l.Name; Why = $(if ($hung) { 'ไม่ตอบสนอง' } else { 'ไม่มีหน้าต่าง' }) }
+                }
+            }
+        }
+        $stuck
     }
 
     function Remove-Locks($pr) {
@@ -635,7 +814,8 @@ $engine = {
     function Initialize-Sqlite {
         if (-not (Test-Path "$env:SystemRoot\System32\winsqlite3.dll")) { return $false }
         if (-not ('TbFix.Sqlite' -as [type])) {
-            Add-Type -Namespace TbFix -Name Sqlite -MemberDefinition @'
+            try {
+            Add-Type -Namespace TbFix -Name Sqlite -ErrorAction Stop -MemberDefinition @'
 [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_open16", CharSet = CharSet.Unicode)] public static extern int Open(string file, out IntPtr db);
 [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_close_v2")] public static extern int Close(IntPtr db);
 [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_busy_timeout")] public static extern int BusyTimeout(IntPtr db, int ms);
@@ -644,6 +824,7 @@ $engine = {
 [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_column_text16")] public static extern IntPtr ColumnText(IntPtr stmt, int col);
 [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_finalize")] public static extern int Finalize(IntPtr stmt);
 '@
+            } catch { return $false }   # compiler blocked (antivirus / AppLocker): skip the database step
         }
         $true
     }
@@ -752,7 +933,13 @@ $engine = {
         Prog 3 'กำลังค้นหาโปรไฟล์ Thunderbird...'
         $profiles = @(Get-TbProfiles)   # @() - a single PSCustomObject has no .Count in PowerShell 5.1
         $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })
-        if (-not $accounts) { Log 'WARN' 'ไม่พบบัญชีอีเมลใน Thunderbird บนเครื่องนี้'; $sync.Results = @(); return }
+        if (-not $accounts) {
+            Log 'WARN' $(if ($profiles) { "พบโปรไฟล์ Thunderbird $($profiles.Count) โปรไฟล์ แต่ไม่มีบัญชีอีเมล" }
+                         else { 'ไม่พบโปรไฟล์ Thunderbird - ถ้าใช้ Thunderbird Portable หรือโปรไฟล์อยู่ที่อื่น กด "เพิ่มโปรไฟล์เอง"' })
+            $sync.Results = @(); return
+        }
+        $stuckList = @(Get-StuckThunderbird $profiles)
+        foreach ($s in $stuckList) { Log 'WARN' "Thunderbird ค้างอยู่เบื้องหลัง: PID $($s.Id) ($($s.Why)) ถือโปรไฟล์ $(Split-Path $s.Profile -Leaf) ไว้" }
 
         if ($opt.Mode -eq 'fix') {
             New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
@@ -776,6 +963,7 @@ $engine = {
                 Repair-Account $targets[$i]
             }
             Log 'STEP' 'สแกนตรวจสอบอีกครั้งหลังแก้ไข'
+            $stuckList = @(Get-StuckThunderbird $profiles)
             $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })   # prefs.js may have changed
         }
 
@@ -793,6 +981,7 @@ $engine = {
             }
             $tbRunning = [bool](Get-Process thunderbird -ErrorAction SilentlyContinue)
             Log 'STEP' 'สแกนตรวจสอบอีกครั้งหลัง Optimize'
+            $stuckList = @(Get-StuckThunderbird $profiles)
             $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })
         }
 
@@ -902,8 +1091,32 @@ $form.Text = 'Thunderbird Mailbox Fix Tool'
 $form.ClientSize = New-Object Drawing.Size($W, 716)
 $form.StartPosition = 'CenterScreen'; $form.FormBorderStyle = 'FixedSingle'; $form.MaximizeBox = $false
 $form.BackColor = $C.Bg; $form.Font = F 9.5
-$tbExe = @("$env:ProgramFiles\Mozilla Thunderbird\thunderbird.exe", "${env:ProgramFiles(x86)}\Mozilla Thunderbird\thunderbird.exe") |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
+# Where Thunderbird is installed: registry App Paths (any install folder), the usual folders,
+# a per-user install, and - only when asked, it is slower - the Microsoft Store version.
+function Find-Thunderbird([switch]$IncludeStore) {
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\thunderbird.exe',
+                   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\thunderbird.exe',
+                   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\thunderbird.exe') {
+        $v = (Get-ItemProperty $k -ErrorAction SilentlyContinue).'(default)'
+        if ($v) { $v = [Environment]::ExpandEnvironmentVariables($v.Trim('"')); if (Test-Path -LiteralPath $v) { return @{ Exe = $v } } }
+    }
+    foreach ($d in $env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA, (Join-Path "$env:LOCALAPPDATA" 'Programs')) {
+        if (-not $d) { continue }
+        $e = Join-Path $d 'Mozilla Thunderbird\thunderbird.exe'
+        if (Test-Path -LiteralPath $e) { return @{ Exe = $e } }
+    }
+    if ($IncludeStore) {
+        try {
+            $pkg = Get-AppxPackage -Name '*Thunderbird*' -ErrorAction Stop | Select-Object -First 1
+            if ($pkg) {
+                $appId = (Get-AppxPackageManifest $pkg).Package.Applications.Application | Select-Object -First 1 -ExpandProperty Id
+                return @{ AppId = "$($pkg.PackageFamilyName)!$appId" }
+            }
+        } catch {}
+    }
+    $null
+}
+$tbExe = (Find-Thunderbird).Exe
 $selfExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $iconSrc = if ($selfExe -notmatch '\\powershell(_ise)?\.exe$') { $selfExe } else { $tbExe }   # packaged exe has its own icon
 if ($iconSrc) { try { $form.Icon = [Drawing.Icon]::ExtractAssociatedIcon($iconSrc) } catch {} }
@@ -957,16 +1170,19 @@ $tt.SetToolTip($tglDef, 'เพิ่มโฟลเดอร์โปรไฟ�
 $listCard = New-Card $form 24 196 952 300 'บัญชีอีเมลใน Thunderbird'
 $lblSummary = New-Label $listCard '' 420 15 (F 9.5) $C.Muted 400
 $lblSummary.TextAlign = 'MiddleRight'
+$lnkAdd  = New-Object Windows.Forms.LinkLabel
 $lnkAll  = New-Object Windows.Forms.LinkLabel
 $lnkNone = New-Object Windows.Forms.LinkLabel
-foreach ($pair in @(@($lnkAll, 'เลือกทั้งหมด', 832), @($lnkNone, 'ล้างการเลือก', 892))) {
+foreach ($pair in @(@($lnkAdd, '+ เพิ่มโปรไฟล์เอง', 700), @($lnkAll, 'เลือกทั้งหมด', 832), @($lnkNone, 'ล้างการเลือก', 892))) {
     $pair[0].Text = $pair[1]; $pair[0].Location = New-Object Drawing.Point($pair[2], 16); $pair[0].AutoSize = $true
     $pair[0].Font = F 9; $pair[0].LinkColor = $C.Accent; $pair[0].LinkBehavior = 'HoverUnderline'; $pair[0].BackColor = 'Transparent'
     $listCard.Controls.Add($pair[0])
 }
 $lnkNone.Left = 952 - 18 - $lnkNone.PreferredWidth
 $lnkAll.Left  = $lnkNone.Left - 14 - $lnkAll.PreferredWidth
-$lblSummary.Left = $lnkAll.Left - 18 - $lblSummary.Width
+$lnkAdd.Left  = $lnkAll.Left - 22 - $lnkAdd.PreferredWidth
+$lnkAdd.Font  = F 9 'Bold'
+$lblSummary.Left = $lnkAdd.Left - 18 - $lblSummary.Width
 
 $lv = New-Object Windows.Forms.ListView
 $lv.SetBounds(1, 46, 950, 253)
@@ -1010,7 +1226,7 @@ $logCard.Controls.Add($log)
 # ================================================================================
 #  BEHAVIOUR
 # ================================================================================
-$script:results = @(); $script:fixedKeys = @(); $script:sync = $null; $script:ps = $null
+$script:results = @(); $script:fixedKeys = @(); $script:sync = $null; $script:ps = $null; $script:extraProfiles = @()
 $script:mode = $null; $script:backupDir = $null
 $statusStyle = @{
     ok      = @{ Text = [string][char]0x25CF + ' ปกติ';         Color = $C.Green }
@@ -1083,7 +1299,10 @@ function Update-AccountList {
     $nWarn = @($script:results | Where-Object Status -eq 'warn').Count
     $lblSummary.Text = "พบ $($script:results.Count) บัญชี   •   มีปัญหา $nProb   •   ควรตรวจสอบ $nWarn"
     $lblEmpty.Visible = ($script:results.Count -eq 0)
-    if ($script:results.Count -eq 0) { $lblEmpty.Text = 'ไม่พบบัญชีอีเมลใน Thunderbird' }
+    if ($script:results.Count -eq 0) {
+        $lblEmpty.Text = "ไม่พบบัญชีอีเมลใน Thunderbird`r`nถ้าใช้ Thunderbird Portable หรือโปรไฟล์อยู่ที่อื่น กด ""+ เพิ่มโปรไฟล์เอง"" ด้านบนขวา"
+        $lblEmpty.Height = 48; $lblEmpty.Top = 140
+    }
     $first = $lv.Items | Where-Object { $_.Tag.Status -ne 'ok' } | Select-Object -First 1
     if (-not $first -and $lv.Items.Count) { $first = $lv.Items[0] }
     if ($first) { $first.Selected = $true } else { Show-Details $null }
@@ -1109,6 +1328,7 @@ function Start-Engine($mode, $keys, $login) {
         Progress = 0; StatusText = ''; Done = $false; Results = $null; TbRunning = $false
         OptDone = $false; OptSaved = [int64]0; OptWarn = 0; LoginResult = $null })
     $opt = @{ Mode = $mode; Targets = @($keys); IsAdmin = $isAdmin; BackupDir = $script:backupDir; Login = $login
+              ExtraProfiles = @($script:extraProfiles)
               RebuildIndex = [bool]$tglIndex.Tag; Defender = [bool]$tglDef.Tag }
     $script:ps = [PowerShell]::Create()
     [void]$script:ps.AddScript($engine).AddArgument($script:sync).AddArgument($opt)
@@ -1141,7 +1361,7 @@ function Read-Password($r) {
 function Start-Fix($keys) {
     if (-not $keys) { return }
     if (Get-Process thunderbird -ErrorAction SilentlyContinue) {
-        $a = [Windows.Forms.MessageBox]::Show("Thunderbird กำลังเปิดอยู่ ระบบจะปิด Thunderbird ก่อนเริ่มแก้ไข`r`n`r`nดำเนินการต่อหรือไม่?",
+        $a = [Windows.Forms.MessageBox]::Show($form, "Thunderbird กำลังเปิดอยู่ ระบบจะปิด Thunderbird ก่อนเริ่มแก้ไข`r`n`r`nดำเนินการต่อหรือไม่?",
             'Thunderbird Fix', 'YesNo', 'Question')
         if ($a -ne 'Yes') { return }
     }
@@ -1166,7 +1386,7 @@ $timer.Add_Tick({ try {
         $lr = $script:sync.LoginResult
         if ($lr) {
             $lblStatus.Text = "$($script:loginEmail): $($lr.Summary)"; $lblStatus.ForeColor = $(if ($lr.Ok) { $C.Green } else { $C.Red })
-            [Windows.Forms.MessageBox]::Show($lr.Text, "ทดสอบรับเมล - $($script:loginEmail)", 'OK', $(if ($lr.Ok) { 'Information' } else { 'Error' })) | Out-Null
+            [Windows.Forms.MessageBox]::Show($form, $lr.Text, "ทดสอบรับเมล - $($script:loginEmail)", 'OK', $(if ($lr.Ok) { 'Information' } else { 'Error' })) | Out-Null
         }
         return
     }
@@ -1182,11 +1402,11 @@ $timer.Add_Tick({ try {
         $bad  = $done.Count - $ok
         if ($bad) {
             $lblStatus.Text = "แก้ไขสำเร็จ $ok บัญชี  •  ยังมีปัญหา $bad บัญชี (ดูรายละเอียดด้านล่าง)"; $lblStatus.ForeColor = $C.Red
-            [Windows.Forms.MessageBox]::Show("แก้ไขสำเร็จ $ok บัญชี`r`nยังมีปัญหา $bad บัญชี - คลิกที่บัญชีเพื่อดูสิ่งที่ต้องแก้เอง",
+            [Windows.Forms.MessageBox]::Show($form, "แก้ไขสำเร็จ $ok บัญชี`r`nยังมีปัญหา $bad บัญชี - คลิกที่บัญชีเพื่อดูสิ่งที่ต้องแก้เอง",
                 'Thunderbird Fix', 'OK', 'Warning') | Out-Null
         } else {
             $lblStatus.Text = "แก้ไขเรียบร้อยทั้ง $ok บัญชี  •  เปิด Thunderbird แล้วลองส่ง/รับอีเมลได้เลย"; $lblStatus.ForeColor = $C.Green
-            [Windows.Forms.MessageBox]::Show("แก้ไขเรียบร้อยทั้ง $ok บัญชี`r`n`r`nเปิด Thunderbird แล้วลองใช้งาน หากยังพบปัญหาในโฟลเดอร์ใด ให้คลิกขวาที่โฟลเดอร์ > Properties > Repair Folder",
+            [Windows.Forms.MessageBox]::Show($form, "แก้ไขเรียบร้อยทั้ง $ok บัญชี`r`n`r`nเปิด Thunderbird แล้วลองใช้งาน หากยังพบปัญหาในโฟลเดอร์ใด ให้คลิกขวาที่โฟลเดอร์ > Properties > Repair Folder",
                 'Thunderbird Fix', 'OK', 'Information') | Out-Null
         }
     } elseif ($script:mode -eq 'optimize') {
@@ -1200,7 +1420,7 @@ $timer.Add_Tick({ try {
         } else {
             $lblStatus.Text = "Optimize เสร็จเรียบร้อย  •  ลดขนาดฐานข้อมูลได้ $mb MB"; $lblStatus.ForeColor = $C.Green
         }
-        [Windows.Forms.MessageBox]::Show($lblStatus.Text, 'Thunderbird Fix', 'OK', $(if ($script:sync.OptDone -and -not $nW) { 'Information' } else { 'Warning' })) | Out-Null
+        [Windows.Forms.MessageBox]::Show($form, $lblStatus.Text, 'Thunderbird Fix', 'OK', $(if ($script:sync.OptDone -and -not $nW) { 'Information' } else { 'Warning' })) | Out-Null
     } else {
         if ($nProb) { $lblStatus.Text = "สแกนเสร็จ  •  พบ $nProb บัญชีที่มีปัญหา - กด ""แก้ไขอัตโนมัติ"" เพื่อแก้ไข"; $lblStatus.ForeColor = $C.Red }
         else        { $lblStatus.Text = 'สแกนเสร็จ  •  ไม่พบบัญชีที่มีปัญหา'; $lblStatus.ForeColor = $C.Green }
@@ -1220,17 +1440,17 @@ $btnScan.Add_Click({ $script:fixedKeys = @(); $log.Clear(); Start-Engine 'scan' 
 $btnFixAll.Add_Click({
     $keys = @($script:results | Where-Object Status -eq 'problem' | ForEach-Object { $_.Key })
     if (-not $keys) {
-        [Windows.Forms.MessageBox]::Show('ไม่พบบัญชีที่มีปัญหาที่แก้อัตโนมัติได้', 'Thunderbird Fix', 'OK', 'Information') | Out-Null; return }
+        [Windows.Forms.MessageBox]::Show($form, 'ไม่พบบัญชีที่มีปัญหาที่แก้อัตโนมัติได้', 'Thunderbird Fix', 'OK', 'Information') | Out-Null; return }
     Start-Fix $keys
 })
 $btnFixSel.Add_Click({
     $keys = @($lv.CheckedItems | ForEach-Object { $_.Tag.Key })
     if (-not $keys) {
-        [Windows.Forms.MessageBox]::Show('กรุณาติ๊กเลือกบัญชีที่ต้องการแก้ไขก่อน', 'Thunderbird Fix', 'OK', 'Information') | Out-Null; return }
+        [Windows.Forms.MessageBox]::Show($form, 'กรุณาติ๊กเลือกบัญชีที่ต้องการแก้ไขก่อน', 'Thunderbird Fix', 'OK', 'Information') | Out-Null; return }
     Start-Fix $keys
 })
 $btnOpt.Add_Click({
-    $a = [Windows.Forms.MessageBox]::Show(
+    $a = [Windows.Forms.MessageBox]::Show($form, 
         "Optimize จะปิด Thunderbird แล้วทำสิ่งต่อไปนี้กับทุกโปรไฟล์:`r`n`r`n" +
         "•  ตรวจความเสียหายและบีบอัดฐานข้อมูล (SQLite)`r`n" +
         "•  ซ่อมไฟล์ตั้งค่าที่เสีย (Thunderbird จะสร้างใหม่)`r`n" +
@@ -1254,15 +1474,39 @@ $btnLogin.Add_Click({
 })
 $btnBackup.Add_Click({ if ($script:backupDir -and (Test-Path $script:backupDir)) { Start-Process explorer.exe $script:backupDir } })
 $btnTB.Add_Click({
-    if ($tbExe) { Start-Process $tbExe } else { [Windows.Forms.MessageBox]::Show('ไม่พบ thunderbird.exe', 'Thunderbird Fix') | Out-Null }
+    $tb = Find-Thunderbird -IncludeStore
+    if ($tb.Exe)       { Start-Process $tb.Exe }
+    elseif ($tb.AppId) { Start-Process explorer.exe "shell:AppsFolder\$($tb.AppId)" }   # Microsoft Store version
+    else { [Windows.Forms.MessageBox]::Show($form, 'ไม่พบโปรแกรม Thunderbird ในเครื่องนี้', 'Thunderbird Fix', 'OK', 'Warning') | Out-Null }
+})
+$lnkAdd.Add_LinkClicked({
+    $fb = New-Object Windows.Forms.FolderBrowserDialog
+    $fb.Description = 'เลือกโฟลเดอร์โปรไฟล์ Thunderbird (โฟลเดอร์ที่มีไฟล์ prefs.js) เช่น ThunderbirdPortable\Data\profile'
+    if ($fb.ShowDialog($form) -ne 'OK') { return }
+    # the folder itself, or profiles up to 3 levels below it (e.g. the whole Thunderbird Portable folder)
+    $picked = @(Get-ChildItem -LiteralPath $fb.SelectedPath -Filter 'prefs.js' -File -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.DirectoryName } | Sort-Object -Unique)
+    if (-not $picked) {
+        [Windows.Forms.MessageBox]::Show($form, 'ไม่พบโปรไฟล์ Thunderbird (ไฟล์ prefs.js) ในโฟลเดอร์นี้', 'Thunderbird Fix', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $script:extraProfiles = @($script:extraProfiles + $picked | Sort-Object -Unique)
+    $log.Clear(); Start-Engine 'scan' @()
 })
 
-$form.Add_Shown({ Start-Engine 'scan' @() })
+$form.Add_Shown({ $global:TbFixUiShown = $true; Start-Engine 'scan' @() })
 $form.Add_FormClosing({
     if ($script:sync -and -not $script:sync.Done) {
-        $_.Cancel = ([Windows.Forms.MessageBox]::Show('ระบบกำลังทำงานอยู่ ต้องการปิดหรือไม่?', 'Thunderbird Fix', 'YesNo', 'Warning') -ne 'Yes')
+        # Windows shutting down / Task Manager: never block it with a question
+        if ($_.CloseReason -eq 'UserClosing') {
+            $_.Cancel = ([Windows.Forms.MessageBox]::Show($form, 'ระบบกำลังทำงานอยู่ ต้องการปิดหรือไม่?', 'Thunderbird Fix', 'YesNo', 'Warning') -ne 'Yes')
+        }
+        if (-not $_.Cancel) { $timer.Stop(); try { [void]$script:ps.BeginStop($null, $null) } catch {} }
     }
 })
 
 [void]$form.ShowDialog()
-$mutex.ReleaseMutex(); $mutex.Dispose()
+try { $mutex.ReleaseMutex() } catch {}; $mutex.Dispose()
+# End the process now - a background scan must not keep it alive (that left copies "stuck" until a restart).
+# The exe launcher exits on its own; only end the process when this script owns it (-File).
+if ($PSCommandPath) { [Environment]::Exit(0) }

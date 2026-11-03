@@ -8,7 +8,7 @@ param(
     [string]$Script = "$PSScriptRoot\Thunderbird-Fix-Tool.ps1",
     [string]$Out    = "$PSScriptRoot\dist\ThunderbirdMailFix.exe",
     [ValidateSet('highestAvailable', 'requireAdministrator', 'asInvoker')]
-    [string]$Level  = 'highestAvailable',
+    [string]$Level  = 'asInvoker',
     [switch]$NewIcon
 )
 $ErrorActionPreference = 'Stop'

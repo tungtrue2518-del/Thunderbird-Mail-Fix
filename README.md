@@ -39,6 +39,8 @@ A single-file Windows tool (exe or PowerShell script) that scans every Thunderbi
 | ไฟล์ดัชนีโฟลเดอร์ (.msf) เสีย | ✅ | ✅ |
 | ไฟล์ค้างจากการ Compact ที่ล้มเหลว (nstmp) | ✅ | ✅ |
 | ไฟล์ล็อกโปรไฟล์ค้าง, ไฟล์ชั่วคราวค้าง | ✅ | ✅ |
+| **Thunderbird ค้างอยู่เบื้องหลัง** (เปิด Thunderbird ไม่ขึ้น / ต้องรีสตาร์ทเครื่องถึงจะหาย) | ✅ | ✅ ปิดให้โดยไม่ต้องรีสตาร์ท |
+| ไฟล์เมลถูกโปรแกรมอื่นเปิดค้าง (บอกชื่อโปรแกรม เช่น แอนตี้ไวรัส / Windows Search) | ✅ | แจ้งวิธีแก้ |
 | เมลไม่เข้า เพราะปิด "ตรวจเมลใหม่อัตโนมัติ" ไว้ | ✅ | ✅ |
 | ไฟล์สถานะ POP3 (popstate.dat) เสีย ทำให้ Thunderbird ข้ามเมลใหม่ | ✅ | ✅ |
 | POP3 ลบเมลจากเซิร์ฟเวอร์ (ไม่ได้ติ๊ก Leave messages on server) – เครื่องอื่นดึงเมลไปก่อน | ✅ | แจ้งวิธีแก้ |
@@ -85,6 +87,26 @@ A single-file Windows tool (exe or PowerShell script) that scans every Thunderbi
 - **สร้างดัชนีใหม่ (.msf)** – ตอนแก้ไข จะย้ายไฟล์ดัชนีทั้งหมดออกให้ Thunderbird สร้างใหม่ ใช้เมื่อยังพบข้อผิดพลาดซ้ำ
 - **ยกเว้นจาก Defender** – เพิ่มโฟลเดอร์โปรไฟล์เป็นข้อยกเว้นของ Windows Defender เมื่อแอนตี้ไวรัสล็อกไฟล์เมล
 
+## หาโปรไฟล์ Thunderbird เจอที่ไหนบ้าง
+
+- ติดตั้งแบบปกติ (`%APPDATA%\Thunderbird`) ของทุกผู้ใช้ในเครื่อง รวมถึงผู้ใช้ที่โปรไฟล์อยู่ไดรฟ์อื่น
+- Thunderbird จาก **Microsoft Store**
+- ไม่มีไฟล์ `profiles.ini` หรือไฟล์เสีย – ค้นจากโฟลเดอร์ `Profiles` โดยตรง
+- โปรไฟล์ที่ย้ายไปไว้ที่อื่น (path แบบเต็ม / มีตัวแปร เช่น `%USERPROFILE%`)
+- **Thunderbird Portable** หรือโปรไฟล์ที่อื่น – กด **+ เพิ่มโปรไฟล์เอง** แล้วเลือกโฟลเดอร์
+
+## โปรแกรมเปิดไม่ติด?
+
+| อาการ | v1.2.1 จัดการให้ |
+|---|---|
+| กด **No** ที่หน้าต่างขอสิทธิ์ Admin แล้วโปรแกรมไม่เปิด | เปิดต่อแบบผู้ใช้ปัจจุบัน (สแกนเฉพาะโปรไฟล์ตัวเอง) |
+| เปิดจาก shared server ผ่านไดรฟ์ที่ map ไว้ (เช่น `Z:`) แล้วไม่ขึ้น | เปลี่ยนเป็น path จริง `\\server\share\...` ก่อนขอสิทธิ์ Admin |
+| เปิดซ้ำแล้วไม่ขึ้น / ขึ้นว่าเปิดอยู่แล้ว | ดึงหน้าต่างเดิมขึ้นมาให้ ถ้าตัวเดิมค้างอยู่เบื้องหลังจะถามเพื่อปิดตัวที่ค้าง |
+| ปิดหน้าต่างแล้วโปรแกรมยังค้างอยู่ในเครื่อง | ปิดโปรแกรมจริงทันที ไม่ค้างเบื้องหลัง |
+| เปิดแล้วเงียบ ไม่มีอะไรขึ้น | แสดงข้อความบอกสาเหตุ และบันทึกไว้ที่ `%TEMP%\ThunderbirdMailFix-errors.log` |
+
+ถ้ายังเปิดไม่ได้ ส่วนใหญ่เป็นเพราะแอนตี้ไวรัสบล็อกไฟล์ exe ให้เพิ่ม `ThunderbirdMailFix.exe` เป็นข้อยกเว้น
+
 ## ความปลอดภัยของข้อมูล
 
 - **ไม่มีการลบอีเมล** ไฟล์ที่นำออกจากโปรไฟล์จะถูก **ย้าย** ไปที่ `Desktop\Thunderbird-Fix-Backup-<วันเวลา>` พร้อมไฟล์ log
@@ -100,8 +122,20 @@ A single-file Windows tool (exe or PowerShell script) that scans every Thunderbi
 | `Thunderbird-Fix-Tool.ps1` | ตัวโปรแกรมทั้งหมด (หน้าต่าง + ระบบสแกน/แก้ไข/Optimize) |
 | `build.ps1` | สร้างไฟล์ `dist\ThunderbirdMailFix.exe` |
 | `build/Launcher.cs` | ตัวเปิดโปรแกรมของ exe (ฝังสคริปต์ไว้ข้างในแล้วรันในตัว) |
-| `build/app.manifest` | กำหนดสิทธิ์ Administrator ของ exe |
+| `build/app.manifest` | manifest ของ exe (ตัว launcher ขอสิทธิ์ Admin เอง) |
 | `build/app.ico` | ไอคอนโปรแกรม |
+| `tests/feature-test.ps1` | Dry test ทุกฟีเจอร์ผ่านหน้าต่างจริง (สแกน / แก้ไข / ทดสอบรับเมล / Optimize) |
+| `tests/launch-test.ps1` | Dry test การเปิดโปรแกรม การหา Thunderbird และกรณีค้าง |
+
+### Dry test
+
+ทดสอบกับโปรไฟล์จำลองเท่านั้น ไม่แตะ Thunderbird จริงในเครื่อง
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\feature-test.ps1
+powershell -ExecutionPolicy Bypass -File .\tests\feature-test.ps1 -Build .\build.ps1
+powershell -ExecutionPolicy Bypass -File .\tests\launch-test.ps1 -Tool .\Thunderbird-Fix-Tool.ps1 -Root $env:TEMP\tblaunch -ShotDir $env:TEMP -Build .\build.ps1
+```
 
 ### สร้างไฟล์ .exe เอง
 
@@ -114,6 +148,16 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - exe ไม่ได้ลงลายเซ็นดิจิทัล Windows SmartScreen หรือแอนตี้ไวรัสบางตัวอาจเตือนครั้งแรก ให้กด "More info > Run anyway" หรือเพิ่มเป็นข้อยกเว้น
 
 ## ประวัติเวอร์ชัน
+
+### v1.2.1 – เปิดติดทุกครั้ง หา Thunderbird เจอ ไม่ต้องรีสตาร์ท
+- ตรวจและปิด **Thunderbird ที่ค้างอยู่เบื้องหลัง** (ถือล็อกโปรไฟล์ไว้แต่ไม่มีหน้าต่าง / ไม่ตอบสนอง) แทนการรีสตาร์ทเครื่อง
+- บอกชื่อโปรแกรมที่เปิดไฟล์เมลค้างไว้ (ใช้ Windows Restart Manager)
+- หาโปรไฟล์เจอเพิ่ม: Microsoft Store, ไม่มี profiles.ini, path แบบเต็ม/มีตัวแปร, ปุ่ม **+ เพิ่มโปรไฟล์เอง** สำหรับ Thunderbird Portable
+- ปุ่ม **เปิด Thunderbird** หาโปรแกรมจาก Registry, ติดตั้งแบบผู้ใช้เดียว และ Microsoft Store
+- exe: กด No ที่ UAC แล้วยังเปิดได้, เปิดจากไดรฟ์ที่ map / SUBST ได้, แสดงข้อความเมื่อเปิดไม่สำเร็จ
+- เปิดซ้ำ = ดึงหน้าต่างเดิมขึ้นมา, ตัวเก่าที่ค้างถามเพื่อปิดให้, เปิดซ้อนกับตัวที่เป็น Admin ไม่ error
+- ปิดหน้าต่างแล้วโปรแกรมจบจริง (ไม่ค้างเบื้องหลัง), กล่องข้อความไม่ไปซ่อนหลังหน้าต่างอื่น, ไม่ขวางการปิดเครื่อง
+- เพิ่ม Dry test อัตโนมัติในโฟลเดอร์ `tests/`
 
 ### v1.2.0 – เมลไม่เข้า (POP3)
 - เพิ่มปุ่ม **ทดสอบรับเมล**: ล็อกอินเข้าเซิร์ฟเวอร์ POP3 จริง บอกได้ว่ารหัสผิด / กล่องเมลถูกล็อก / เซิร์ฟเวอร์เต็ม / มีเมลรอกี่ฉบับ

@@ -4,7 +4,7 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <!-- Admins get a UAC prompt (fix every user on the PC); standard users still run (own profile only) -->
+        <!-- asInvoker: the launcher asks for elevation itself, so "No" on UAC still opens the tool -->
         <requestedExecutionLevel level="__LEVEL__" uiAccess="false"/>
       </requestedPrivileges>
     </security>
