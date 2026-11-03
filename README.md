@@ -157,6 +157,7 @@ A single-file Windows tool that scans every Thunderbird mail account on a PC, fi
 | `build/app.manifest`, `build/app.ico` | manifest และไอคอนของ exe |
 | `tests/feature-test.ps1` | Dry test ทุกฟีเจอร์ผ่านหน้าต่างจริง (มีเซิร์ฟเวอร์ POP3 / SMTP จำลอง) |
 | `tests/launch-test.ps1` | Dry test การเปิดโปรแกรม การหา Thunderbird และกรณีค้าง |
+| `docs/SKILL.md` | Claude skill: หลักการ โครงสร้าง วิธีทดสอบ และข้อควรระวัง สำหรับสร้างโปรแกรม Autofix ตัวต่อไป (เช่น Outlook) |
 
 **สร้าง exe** – ใช้ C# compiler ที่มากับ Windows ไม่ต้องติดตั้งอะไรเพิ่ม เลขเวอร์ชันอ่านจาก `$AppVersion` ในสคริปต์
 ```powershell
