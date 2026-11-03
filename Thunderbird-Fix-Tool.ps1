@@ -55,7 +55,7 @@ if (-not $isAdmin -and $PSCommandPath -and $env:TBFIX_RELAUNCHED -ne '1') {
     } catch { $env:TBFIX_RELAUNCHED = $null }   # user pressed "No" on UAC - continue without admin
 }
 
-$AppVersion = '1.2.1'
+$AppVersion = '1.3.0'
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -79,6 +79,9 @@ $mutexName = 'ThunderbirdMailFix-SingleInstance'
 try { $mutex = New-Object Threading.Mutex($false, $mutexName) }
 catch { $mutex = $null }   # access denied: a copy running as Administrator owns it
 if (-not $mutex -or -not (Get-SingleInstance 0)) {
+    # already open: bring that window to the front by its title (works whichever process owns it,
+    # even while it shows a menu or a dialog, and even if it runs as Administrator)
+    try { [Microsoft.VisualBasic.Interaction]::AppActivate('Thunderbird Mailbox Fix Tool'); return } catch {}
     $others = Get-OtherCopies
     # an open window of this tool, however it was started (exe, script, renamed, as Administrator)
     $mySession = [Diagnostics.Process]::GetCurrentProcess().SessionId
@@ -149,37 +152,98 @@ $engine = {
     }
 
     # Every Thunderbird profile on the PC, with the SID of the Windows user who owns it
-    function New-TbProfile($user, $userDir, $sid, $path) {
+    function New-TbProfile($user, $userDir, $sid, $path, $root = $null) {
         [pscustomobject]@{
-            User = $user; UserDir = $userDir; Path = (Resolve-Path -LiteralPath $path).Path; OwnerSid = $sid
+            User = $user; UserDir = $userDir; Path = (Resolve-Path -LiteralPath $path).Path; OwnerSid = $sid; Root = $root
             # who counts as "the user can write": owner, Everyone, Authenticated Users, Users
             Sids = @($sid, 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545') }
     }
 
-    # Profile folders listed in <root>\profiles.ini; when the file is missing or lists nothing
-    # usable, fall back to every <root>\Profiles\* folder that has a prefs.js
-    function Get-ProfilePaths($tbRoot) {
-        $paths = @()
+    # Sections of profiles.ini as hashtables (Name, Path, IsRelative, Default, ... + _Section, _Full)
+    function Read-ProfilesIni($tbRoot) {
         $ini = Join-Path $tbRoot 'profiles.ini'
-        if (Test-Path -LiteralPath $ini) {
-            $section = @{}
-            foreach ($line in @(Get-Content -LiteralPath $ini -ErrorAction SilentlyContinue) + '[end]') {
-                if ($line -match '^\s*\[') {
-                    if ($section.Path) {
-                        $p = [Environment]::ExpandEnvironmentVariables($section.Path.Trim()) -replace '/', '\'
-                        $paths += if ($section.IsRelative -ne '0') { Join-Path $tbRoot $p } else { $p }
-                    }
-                    $section = @{}
+        $out = @()
+        if (-not (Test-Path -LiteralPath $ini)) { return $out }
+        $section = $null
+        foreach ($line in @(Get-Content -LiteralPath $ini -ErrorAction SilentlyContinue) + '[end]') {
+            if ($line -match '^\s*\[(.+)\]') {
+                if ($section -and $section.Path) {
+                    $p = [Environment]::ExpandEnvironmentVariables($section.Path.Trim()) -replace '/', '\'
+                    $section._Full = if ($section.IsRelative -ne '0') { Join-Path $tbRoot $p } else { $p }
                 }
-                elseif ($line -match '^\s*(\w+)\s*=(.*)$') { $section[$Matches[1]] = $Matches[2].Trim() }
+                if ($section) { $out += $section }
+                $section = @{ _Section = $Matches[1] }
+            }
+            elseif ($section -and $line -match '^\s*(\w+)\s*=(.*)$') { $section[$Matches[1]] = $Matches[2].Trim() }
+        }
+        $out
+    }
+
+    # Profile folders: everything listed in profiles.ini PLUS every <root>\Profiles\* folder with a
+    # prefs.js - a profiles.ini that was rewritten can "forget" the profile that still holds all the mail
+    function Get-ProfilePaths($tbRoot) {
+        $paths = @(Read-ProfilesIni $tbRoot | Where-Object { $_._Full } | ForEach-Object { $_._Full }) +
+                 @(Get-ChildItem -LiteralPath (Join-Path $tbRoot 'Profiles') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        @($paths | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'prefs.js') } |
+            ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Sort-Object -Unique)
+    }
+
+    # The profile(s) Thunderbird actually opens: installs.ini / [Install...] in profiles.ini
+    # (Thunderbird 67+), otherwise the profile marked Default=1
+    function Get-DefaultProfilePaths($tbRoot) {
+        $defs = @()
+        $toFull = { param($v) $v = [Environment]::ExpandEnvironmentVariables($v.Trim()) -replace '/', '\'
+                    [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($v)) { $v } else { Join-Path $tbRoot $v })).TrimEnd('\') }
+        $inst = Join-Path $tbRoot 'installs.ini'
+        if (Test-Path -LiteralPath $inst) {
+            foreach ($line in Get-Content -LiteralPath $inst -ErrorAction SilentlyContinue) {
+                if ($line -match '^\s*Default\s*=(.+)$') { $defs += & $toFull $Matches[1] }
             }
         }
-        $paths = @($paths | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'prefs.js') })
-        if (-not $paths) {
-            $paths = @(Get-ChildItem -LiteralPath (Join-Path $tbRoot 'Profiles') -Directory -ErrorAction SilentlyContinue |
-                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'prefs.js') } | ForEach-Object { $_.FullName })
+        $sections = @(Read-ProfilesIni $tbRoot)
+        foreach ($s in $sections | Where-Object { $_._Section -like 'Install*' -and $_.Default }) { $defs += & $toFull $s.Default }
+        if (-not $defs) { $defs = @($sections | Where-Object { $_.Default -eq '1' -and $_._Full } | ForEach-Object { [IO.Path]::GetFullPath($_._Full).TrimEnd('\') }) }
+        @($defs | Sort-Object -Unique)
+    }
+
+    # Point Thunderbird at the profile that has the mail: rewrite every default (installs.ini,
+    # [Install...] sections, Default=1) and list the profile in profiles.ini if it was missing
+    function Set-DefaultProfile($wd) {
+        $root = $wd.Root.TrimEnd('\')
+        $isRel = $wd.Target.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)
+        $value = if ($isRel) { $wd.Target.Substring($root.Length + 1) -replace '\\', '/' } else { $wd.Target }
+        $inst = Join-Path $root 'installs.ini'
+        if (Test-Path -LiteralPath $inst) {
+            Copy-Item -LiteralPath $inst (Join-Path $backupDir 'installs.ini.bak') -Force
+            $lines = @(Get-Content -LiteralPath $inst | ForEach-Object { if ($_ -match '^\s*Default\s*=') { "Default=$value" } else { $_ } })
+            [IO.File]::WriteAllLines($inst, [string[]]$lines, (New-Object Text.UTF8Encoding($false)))
         }
-        $paths
+        $ini = Join-Path $root 'profiles.ini'
+        if (Test-Path -LiteralPath $ini) { Copy-Item -LiteralPath $ini (Join-Path $backupDir 'profiles.ini.bak') -Force }
+        $sections = @(Read-ProfilesIni $root)
+        $hasInstall = [bool]($sections | Where-Object { $_._Section -like 'Install*' })
+        $listed = [bool]($sections | Where-Object { $_._Full -and [IO.Path]::GetFullPath($_._Full).TrimEnd('\') -eq $wd.Target })
+        $out = @(); $sec = ''
+        foreach ($line in @(if (Test-Path -LiteralPath $ini) { Get-Content -LiteralPath $ini })) {
+            if ($line -match '^\s*\[(.+)\]') { $sec = $Matches[1]; $out += $line; continue }
+            if ($line -match '^\s*Default\s*=') {
+                if ($sec -like 'Install*') { $out += "Default=$value" }
+                elseif ($hasInstall) { $out += $line }   # Thunderbird 67+ ignores Default=1 when [Install] exists
+                continue                                  # legacy: Default=1 is re-added below for the target only
+            }
+            $out += $line
+            if (-not $hasInstall -and $sec -notlike 'Install*' -and $line -match '^\s*Path\s*=') {
+                $s = $sections | Where-Object { $_._Section -eq $sec } | Select-Object -First 1
+                if ($s -and $s._Full -and [IO.Path]::GetFullPath($s._Full).TrimEnd('\') -eq $wd.Target) { $out += 'Default=1' }
+            }
+        }
+        if (-not $listed) {
+            $n = 0; while ($sections | Where-Object { $_._Section -eq "Profile$n" }) { $n++ }
+            $out += '', "[Profile$n]", "Name=$(Split-Path $wd.Target -Leaf)", "IsRelative=$(if ($isRel) { 1 } else { 0 })", "Path=$value"
+            if (-not $hasInstall) { $out += 'Default=1' }
+        }
+        [IO.File]::WriteAllLines($ini, [string[]]$out, (New-Object Text.UTF8Encoding($false)))
+        Log 'OK' "ตั้งให้ Thunderbird เปิดโปรไฟล์ $(Split-Path $wd.Target -Leaf) (โปรไฟล์ที่มีเมล) แล้ว - สำรองไฟล์ตั้งค่าเดิมไว้ในโฟลเดอร์สำรอง"
     }
 
     function Get-TbProfiles {
@@ -204,7 +268,7 @@ $engine = {
                 @(Get-ChildItem -LiteralPath (Join-Path $u.FullName 'AppData\Local\Packages') -Directory -Filter '*Thunderbird*' -ErrorAction SilentlyContinue |
                     ForEach-Object { Join-Path $_.FullName 'LocalCache\Roaming\Thunderbird' })
             foreach ($tbRoot in $roots | Where-Object { Test-Path -LiteralPath $_ }) {
-                foreach ($pp in Get-ProfilePaths $tbRoot) { $found += New-TbProfile $u.Name $u.FullName $sid $pp }
+                foreach ($pp in Get-ProfilePaths $tbRoot) { $found += New-TbProfile $u.Name $u.FullName $sid $pp $tbRoot }
             }
         }
         # profiles the user picked by hand (Thunderbird Portable, profile on another drive...)
@@ -260,11 +324,15 @@ $engine = {
             $smtpHost = if ($smtpKey) { $p["mail.smtpserver.$smtpKey.hostname"] }
             $smtpPort = if ($smtpKey) { $p["mail.smtpserver.$smtpKey.port"] }
             if ($smtpHost -and -not $smtpPort) { $smtpPort = if ($p["mail.smtpserver.$smtpKey.try_ssl"] -eq '3') { 465 } else { 587 } }
+            $smtpUser   = if ($smtpKey) { $p["mail.smtpserver.$smtpKey.username"] }
+            $smtpSocket = if ($smtpKey) { $p["mail.smtpserver.$smtpKey.try_ssl"] }
+            $smtpAuth   = if ($smtpKey) { $p["mail.smtpserver.$smtpKey.authMethod"] }
             $scheme = @{ imap = 'imap'; pop3 = 'mailbox' }[$type]
             $list += [pscustomobject]@{
                 Key = "$($pr.Path)|$srv"; ServerKey = $srv; RawType = $type; Email = $email; Server = $hostName
                 Type = @{ imap = 'IMAP'; pop3 = 'POP3'; none = 'Local Folders'; movemail = 'Movemail' }[$type]
                 Dir = $dir; Profile = $pr; Port = [int]$port; SmtpHost = $smtpHost; SmtpPort = [int]$smtpPort; Ssl = $ssl
+                SmtpUser = $smtpUser; SmtpSocket = $smtpSocket; SmtpAuth = $smtpAuth
                 UserName = $p["mail.server.$srv.userName"]; SocketType = $p["mail.server.$srv.socketType"]
                 LeaveOnServer = ($p["mail.server.$srv.leave_on_server"] -eq 'true')
                 GlobalInbox = [bool]$p["mail.server.$srv.deferred_to_account"]
@@ -336,9 +404,8 @@ $engine = {
 
     # Logs in to a POP3 server with the password the user typed (kept in memory only, never logged),
     # exactly like "Get Messages", and explains the server's answer.
-    function Test-Pop3Login($L) {
+    function Test-Pop3Login($L, $pw) {
         Log 'STEP' "ทดสอบรับเมล: $($L.UserName) @ $($L.Server):$($L.Port)"
-        $pw = $L.Password; $L.Password = $null
         $result = @{ Ok = $false; Summary = ''; Text = '' }
         $tcp = New-Object Net.Sockets.TcpClient
         try {
@@ -407,7 +474,93 @@ $engine = {
             Log 'ERR' "$why  (เซิร์ฟเวอร์ตอบ: $serverSaid)"
         }
         finally { $pw = $null; $tcp.Close() }
-        $sync.LoginResult = $result
+        $result
+    }
+
+    # Logs in to the outgoing (SMTP) server like "Send" does - EHLO, STARTTLS, AUTH - and quits
+    # without sending anything. Same password as the incoming test (memory only, never logged).
+    function Test-SmtpLogin($L, $pw) {
+        Log 'STEP' "ทดสอบส่งเมล: $($L.SmtpHost):$($L.SmtpPort)"
+        $user = if ($L.SmtpUser) { $L.SmtpUser } else { $L.UserName }
+        $implicitTls = $L.SmtpSocket -eq '3' -or $L.SmtpPort -eq 465
+        $result = @{ Ok = $false; Summary = ''; Text = '' }
+        $tcp = New-Object Net.Sockets.TcpClient
+        try {
+            $ar = $tcp.BeginConnect($L.SmtpHost, $L.SmtpPort, $null, $null)
+            if (-not ($ar.AsyncWaitHandle.WaitOne(8000) -and $tcp.Connected)) { throw 'CONNECT' }
+            $tcp.ReceiveTimeout = 15000; $tcp.SendTimeout = 15000
+            $raw = $tcp.GetStream()
+            $open = {
+                param($s)
+                $script:smR = New-Object IO.StreamReader($s, [Text.Encoding]::ASCII)
+                $script:smW = New-Object IO.StreamWriter($s, [Text.Encoding]::ASCII); $script:smW.NewLine = "`r`n"
+            }
+            # an SMTP reply can span lines: "250-..." continues, "250 ..." ends it
+            $reply = { $lines = @(); do { $l = $script:smR.ReadLine(); if ($null -eq $l) { break }; $lines += $l } while ($l.Length -ge 4 -and $l[3] -eq '-'); , $lines }
+            $send  = { param($cmd) $script:smW.WriteLine($cmd); $script:smW.Flush(); & $reply }
+            if ($implicitTls) { $tls = New-Object Net.Security.SslStream($raw, $false, { $true }); $tls.AuthenticateAsClient($L.SmtpHost); & $open $tls }
+            else { & $open $raw }
+            $g = & $reply
+            if (-not $g -or $g[-1] -notlike '220*') { throw "GREETING:$($g -join ' ')" }
+            $ehlo = & $send 'EHLO tbfix.local'
+            if (-not $ehlo -or $ehlo[-1] -notlike '250*') { throw "GREETING:$($ehlo -join ' ')" }
+            if (-not $implicitTls -and ($ehlo -match 'STARTTLS')) {
+                $st = & $send 'STARTTLS'
+                if ($st[-1] -notlike '220*') { throw "TLS:$($st -join ' ')" }
+                $tls = New-Object Net.Security.SslStream($raw, $false, { $true }); $tls.AuthenticateAsClient($L.SmtpHost); & $open $tls
+                $ehlo = & $send 'EHLO tbfix.local'
+            } elseif (-not $implicitTls -and $L.SmtpSocket -eq '2') { throw 'NOSTARTTLS' }
+
+            if ($L.SmtpAuth -eq '1') {
+                $result.Ok = $true; $result.Summary = 'เชื่อมต่อเซิร์ฟเวอร์ส่งเมลได้ (ตั้งค่าไว้ว่าไม่ต้องล็อกอิน)'
+            } elseif ($L.SmtpAuth -eq '10') {
+                $result.Ok = $true; $result.Summary = 'เชื่อมต่อเซิร์ฟเวอร์ส่งเมลได้ (ใช้ OAuth2 - ทดสอบรหัสผ่านแบบนี้ไม่ได้)'
+            } else {
+                $auth = ($ehlo | Where-Object { $_ -match 'AUTH[ =]' }) -join ' '
+                $b64 = { param($t) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t)) }
+                if ($auth -match 'PLAIN') { $a = & $send ('AUTH PLAIN ' + (& $b64 "`0$user`0$pw")) }
+                elseif ($auth -match 'LOGIN') {
+                    $a = & $send 'AUTH LOGIN'
+                    if ($a[-1] -like '334*') { $a = & $send (& $b64 $user) }
+                    if ($a[-1] -like '334*') { $a = & $send (& $b64 $pw) }
+                } else { throw 'NOAUTH' }
+                $pw = $null
+                if ($a[-1] -notlike '235*') { throw "AUTH:$($a -join ' ')" }
+                $result.Ok = $true; $result.Summary = 'ล็อกอินเซิร์ฟเวอร์ส่งเมลสำเร็จ - ส่งเมลได้'
+            }
+            [void](& $send 'QUIT')
+            Log 'OK' $result.Summary
+            $result.Text = "✔ $($result.Summary)`r`n$($L.SmtpHost):$($L.SmtpPort)  •  ผู้ใช้: $user"
+        }
+        catch {
+            $err  = "$($_.Exception.Message)" -replace '^Exception calling .*?: ', ''
+            $code = if ($err -match '^(CONNECT|GREETING|TLS|NOSTARTTLS|NOAUTH|AUTH)') { $Matches[1] } else { 'EX' }
+            $serverSaid = if ($err -match '^(GREETING|TLS|AUTH):(.*)$') { $Matches[2].Trim() } else { $err }
+            $why = switch ($code) {
+                'CONNECT'    { "เชื่อมต่อเซิร์ฟเวอร์ส่งเมล $($L.SmtpHost):$($L.SmtpPort) ไม่ได้ - Firewall / Antivirus / ผู้ให้บริการเน็ตอาจบล็อกพอร์ตนี้ (ลองพอร์ต 587 หรือ 465)" }
+                'GREETING'   { 'เซิร์ฟเวอร์ไม่ตอบแบบ SMTP - ตรวจพอร์ตและการเข้ารหัสของ Outgoing Server (SMTP)' }
+                'TLS'        { 'เริ่มการเข้ารหัส STARTTLS ไม่สำเร็จ - ลองเปลี่ยน Connection security' }
+                'NOSTARTTLS' { 'ตั้งค่าเป็น STARTTLS แต่เซิร์ฟเวอร์ไม่รองรับ - เปลี่ยน Connection security เป็น SSL/TLS พอร์ต 465' }
+                'NOAUTH'     { 'เซิร์ฟเวอร์ไม่เปิดให้ล็อกอินที่พอร์ตนี้ - ลองพอร์ต 587 + STARTTLS หรือ 465 + SSL/TLS' }
+                'AUTH'       {
+                    if ($serverSaid -match '^53[05]|5\.7\.') {
+                        if ($serverSaid -match '^530') { 'ต้องเข้ารหัสก่อนล็อกอิน - ตั้ง Connection security ของ SMTP เป็น STARTTLS หรือ SSL/TLS' }
+                        else { "รหัสผ่านสำหรับส่งเมลไม่ถูกต้อง (ชื่อผู้ใช้ SMTP: $user) - แก้ที่ Settings > Outgoing Server (SMTP) และลบรหัสเก่าใน Saved Passwords" }
+                    } elseif ($serverSaid -match '^4') { 'เซิร์ฟเวอร์ส่งเมลมีปัญหาชั่วคราว - ลองใหม่ภายหลัง' }
+                    else { 'เซิร์ฟเวอร์ปฏิเสธการล็อกอินสำหรับส่งเมล' }
+                }
+                default {
+                    if ($err -match 'timed out|time out|period of time') { 'เซิร์ฟเวอร์ส่งเมลไม่ตอบกลับภายในเวลาที่กำหนด - ตรวจ Firewall' }
+                    elseif ($err -match 'certificate|SSL|TLS|authentication') { 'เชื่อมต่อแบบเข้ารหัส (SSL) กับเซิร์ฟเวอร์ส่งเมลไม่สำเร็จ - ตรวจ Connection security / พอร์ต' }
+                    else { 'เชื่อมต่อเซิร์ฟเวอร์ส่งเมลไม่สำเร็จ' }
+                }
+            }
+            $result.Summary = "ส่งเมลไม่ได้ - $why"
+            $result.Text = "✖ $why`r`n`r`nข้อความจากเซิร์ฟเวอร์: $serverSaid"
+            Log 'ERR' "$why  (เซิร์ฟเวอร์ตอบ: $serverSaid)"
+        }
+        finally { $pw = $null; $tcp.Close() }
+        $result
     }
 
     # popstate.dat remembers which POP3 messages were already downloaded; when it is damaged
@@ -555,6 +708,22 @@ $engine = {
             }
         }
 
+        # Thunderbird opens another (empty / missing) profile instead of this one
+        $wd = $wrongDefault[$acc.Profile.Path]
+        if ($wd) {
+            $issues += New-Issue 'PROFILE_DEFAULT' ("Thunderbird เปิดโปรไฟล์ $(Split-Path $wd.Current -Leaf) " +
+                $(if ($wd.CurrentExists) { '(ไม่มีบัญชีเมล)' } else { '(ไม่มีอยู่จริง)' }) +
+                ' แทนโปรไฟล์นี้ - เปิด Thunderbird แล้วจะเห็นเหมือนเมลหายหมด (เมลยังอยู่ครบ) กดแก้ไขอัตโนมัติเพื่อตั้งให้เปิดโปรไฟล์นี้') $true
+        }
+        # crashes in the last week, and the add-ons that may cause them
+        $crashes = $crashByRoot[[string]$acc.Profile.Root]
+        if ($crashes) {
+            $addons = @($addonsByProfile[$acc.Profile.Path])
+            $issues += New-Issue 'CRASH' ("Thunderbird ปิดตัวเอง (crash) $crashes ครั้งใน 7 วันล่าสุด" + $(if ($addons) {
+                " - มี Add-on เปิดอยู่ $($addons.Count) ตัว ($(($addons | Select-Object -First 3) -join ', ')) ลองกด เปิด Thunderbird > เปิดแบบไม่โหลด Add-on"
+            } else { ' - ลองกด Optimize' })) $false
+        }
+
         # Thunderbird stuck in the background on this profile
         foreach ($s in @($stuckList | Where-Object { $_.Profile -eq $acc.Profile.Path })) {
             $issues += New-Issue 'TB_STUCK' "Thunderbird ค้างอยู่เบื้องหลัง ($($s.Why), PID $($s.Id)) - ทำให้เปิด Thunderbird ไม่ขึ้น / รับเมลไม่ได้ กดแก้ไขอัตโนมัติเพื่อปิดให้ (ไม่ต้องรีสตาร์ทเครื่อง)" $true
@@ -639,11 +808,17 @@ $engine = {
         [pscustomobject]@{
             Key = $acc.Key; Email = $acc.Email; Type = $acc.Type; Server = $acc.Server; Dir = $dir
             RawType = $acc.RawType; Port = $acc.Port; SocketType = $acc.SocketType; UserName = $acc.UserName
+            SmtpHost = $acc.SmtpHost; SmtpPort = $acc.SmtpPort; SmtpUser = $acc.SmtpUser; SmtpSocket = $acc.SmtpSocket; SmtpAuth = $acc.SmtpAuth
             User = $acc.Profile.User; ProfilePath = $acc.Profile.Path; Size = $size; Issues = $issues; Status = $status }
     }
 
     function Repair-Account($acc) {
         Log 'STEP' "กำลังแก้ไข: $($acc.Email)"
+        $wd = $wrongDefault[$acc.Profile.Path]
+        if ($wd -and -not $defaultFixed[$wd.Root]) {
+            try { Set-DefaultProfile $wd; $defaultFixed[$wd.Root] = $true }
+            catch { Log 'WARN' "ตั้งค่าโปรไฟล์เริ่มต้นไม่ได้: $($_.Exception.Message) - เปิด Thunderbird > เลือกโปรไฟล์ (Profile Manager) แล้วเลือกเอง" }
+        }
         if ($acc.CheckNewOff) {
             try {
                 Set-Prefs $acc.Profile.Path @{ "mail.server.$($acc.ServerKey).check_new_mail" = 'true'; "mail.server.$($acc.ServerKey).login_at_startup" = 'true' }
@@ -792,6 +967,39 @@ public static class RM {
         $stuck
     }
 
+    # "All my mail is gone": Thunderbird opens an empty (or missing) profile while the mail sits in
+    # another profile of the same Thunderbird folder. Returns profile path -> what to switch.
+    function Get-WrongDefaults($profiles, $accounts) {
+        $map = @{}
+        foreach ($grp in @($profiles | Where-Object { $_.Root }) | Group-Object Root) {
+            $withMail = @($grp.Group | Where-Object { $p = $_.Path; @($accounts | Where-Object { $_.Profile.Path -eq $p -and $_.RawType -ne 'none' }).Count })
+            if (-not $withMail) { continue }
+            $defaults = @(Get-DefaultProfilePaths $grp.Name)
+            if (-not $defaults) { continue }
+            if ($withMail | Where-Object { $defaults -contains $_.Path.TrimEnd('\') }) { continue }   # opens a profile that has mail: fine
+            $best = $withMail | Sort-Object -Descending {
+                (Get-ChildItem -LiteralPath (Join-Path $_.Path 'Mail'), (Join-Path $_.Path 'ImapMail') -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+            } | Select-Object -First 1
+            $map[$best.Path] = [pscustomobject]@{ Root = $grp.Name; Current = $defaults[0]; CurrentExists = (Test-Path -LiteralPath $defaults[0]); Target = $best.Path.TrimEnd('\') }
+        }
+        $map
+    }
+
+    # Crash reports from the last 7 days (per Thunderbird folder) and the add-ons each profile loads
+    function Get-CrashCount($tbRoot) {
+        if (-not $tbRoot) { return 0 }
+        @(Get-ChildItem -LiteralPath (Join-Path $tbRoot 'Crash Reports\pending') -Filter '*.dmp' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-7) }).Count
+    }
+    function Get-ActiveAddons($profilePath) {
+        $f = Join-Path $profilePath 'extensions.json'
+        if (-not (Test-Path -LiteralPath $f)) { return @() }
+        try { $j = Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return @() }
+        # user-installed add-ons live in "app-profile"; skip only Thunderbird's own (app-builtin / app-system-*)
+        @($j.addons | Where-Object { $_.type -eq 'extension' -and $_.active -and $_.location -notmatch '^app-(builtin|system)' } |
+            ForEach-Object { if ($_.defaultLocale.name) { $_.defaultLocale.name } else { $_.id } })
+    }
+
     function Remove-Locks($pr) {
         foreach ($lock in 'parent.lock', 'lock', '.parentlock') {
             $lp = Join-Path $pr.Path $lock
@@ -928,7 +1136,20 @@ public static class RM {
     }
 
     try {
-        if ($opt.Mode -eq 'login') { Test-Pop3Login $opt.Login; return }
+        if ($opt.Mode -eq 'login') {
+            $pw = $opt.Login.Password; $opt.Login.Password = $null
+            $in = Test-Pop3Login $opt.Login $pw
+            $res = $in
+            if ($opt.Login.SmtpHost) {
+                $out = Test-SmtpLogin $opt.Login $pw
+                $res = @{ Ok = ($in.Ok -and $out.Ok); RecvOk = $in.Ok; SendOk = $out.Ok
+                          Summary = "รับเมล: $(if ($in.Ok) { 'ได้' } else { 'ไม่ได้' })  •  ส่งเมล: $(if ($out.Ok) { 'ได้' } else { 'ไม่ได้' })  -  $($in.Summary)"
+                          Text = "[ รับเมล - POP3 ]`r`n$($in.Text)`r`n`r`n[ ส่งเมล - SMTP ]`r`n$($out.Text)" }
+            }
+            $pw = $null
+            $sync.LoginResult = $res
+            return
+        }
         $tbRunning = [bool](Get-Process thunderbird -ErrorAction SilentlyContinue)
         Prog 3 'กำลังค้นหาโปรไฟล์ Thunderbird...'
         $profiles = @(Get-TbProfiles)   # @() - a single PSCustomObject has no .Count in PowerShell 5.1
@@ -939,6 +1160,10 @@ public static class RM {
             $sync.Results = @(); return
         }
         $stuckList = @(Get-StuckThunderbird $profiles)
+        $wrongDefault = Get-WrongDefaults $profiles $accounts; $defaultFixed = @{}
+        $crashByRoot = @{}; foreach ($r in @($profiles | Where-Object { $_.Root } | ForEach-Object { $_.Root } | Sort-Object -Unique)) { $crashByRoot[$r] = Get-CrashCount $r }
+        $addonsByProfile = @{}; foreach ($pr in $profiles) { $addonsByProfile[$pr.Path] = @(Get-ActiveAddons $pr.Path) }
+        foreach ($k in @($wrongDefault.Keys)) { Log 'WARN' "Thunderbird เปิดโปรไฟล์ $(Split-Path $wrongDefault[$k].Current -Leaf) แต่เมลอยู่ในโปรไฟล์ $(Split-Path $k -Leaf)" }
         foreach ($s in $stuckList) { Log 'WARN' "Thunderbird ค้างอยู่เบื้องหลัง: PID $($s.Id) ($($s.Why)) ถือโปรไฟล์ $(Split-Path $s.Profile -Leaf) ไว้" }
 
         if ($opt.Mode -eq 'fix') {
@@ -965,6 +1190,7 @@ public static class RM {
             Log 'STEP' 'สแกนตรวจสอบอีกครั้งหลังแก้ไข'
             $stuckList = @(Get-StuckThunderbird $profiles)
             $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })   # prefs.js may have changed
+            $wrongDefault = Get-WrongDefaults $profiles $accounts
         }
 
         if ($opt.Mode -eq 'optimize') {
@@ -983,6 +1209,7 @@ public static class RM {
             Log 'STEP' 'สแกนตรวจสอบอีกครั้งหลัง Optimize'
             $stuckList = @(Get-StuckThunderbird $profiles)
             $accounts = @(foreach ($pr in $profiles) { Get-Accounts $pr })
+            $wrongDefault = Get-WrongDefaults $profiles $accounts
         }
 
         $base = if ($opt.Mode -eq 'scan') { 5 } else { 60 }
@@ -1209,9 +1436,9 @@ $track.Controls.Add($fill); $form.Controls.Add($track)
 
 # --- Details + log --------------------------------------------------------------
 $detCard = New-Card $form 24 552 466 150 'รายละเอียดบัญชี'
-$btnLogin = New-Btn $detCard 'ทดสอบรับเมล' (466 - 18 - 118) 8 118 28
+$btnLogin = New-Btn $detCard 'ทดสอบรับ/ส่งเมล' (466 - 18 - 140) 8 140 28
 $btnLogin.Font = F 9.5 'Bold'; $btnLogin.ForeColor = $C.Accent; $btnLogin.Enabled = $false
-$tt.SetToolTip($btnLogin, 'ล็อกอินเข้าเซิร์ฟเวอร์ POP3 แบบเดียวกับปุ่ม Get Messages เพื่อหาสาเหตุที่รับเมลไม่ได้ (ไม่บันทึกรหัสผ่าน)')
+$tt.SetToolTip($btnLogin, 'ล็อกอินเข้าเซิร์ฟเวอร์รับเมล (POP3) และส่งเมล (SMTP) แบบเดียวกับ Get Messages / Send เพื่อหาสาเหตุ (ไม่ส่งเมลจริง ไม่บันทึกรหัสผ่าน)')
 $det = New-Object Windows.Forms.RichTextBox
 $det.SetBounds(18, 40, 436, 104); $det.BorderStyle = 'None'; $det.ReadOnly = $true; $det.BackColor = 'White'
 $det.Font = F 9.5; $det.ForeColor = $C.Muted; $det.Text = 'คลิกที่บัญชีในรายการเพื่อดูรายละเอียด'
@@ -1339,18 +1566,19 @@ function Start-Engine($mode, $keys, $login) {
 # Small password prompt for the login test - the password only lives in memory for this one test
 function Read-Password($r) {
     $d = New-Object Windows.Forms.Form
-    $d.Text = 'ทดสอบการรับเมล'; $d.ClientSize = New-Object Drawing.Size(420, 196)
+    $d.Text = 'ทดสอบการรับ/ส่งเมล'; $d.ClientSize = New-Object Drawing.Size(440, 214)
     $d.FormBorderStyle = 'FixedDialog'; $d.StartPosition = 'CenterParent'; $d.MinimizeBox = $false; $d.MaximizeBox = $false
     $d.BackColor = 'White'; $d.Font = F 9.5; $d.Icon = $form.Icon
     New-Label $d $r.Email 20 16 (F 11 'Bold') $C.Text | Out-Null
-    New-Label $d "ผู้ใช้: $($r.UserName)   •   เซิร์ฟเวอร์: $($r.Server):$($r.Port)$(if ($r.SocketType -eq '3') { ' (SSL)' })" 20 44 (F 9) $C.Muted | Out-Null
-    New-Label $d 'ใส่รหัสผ่านของบัญชีนี้ เพื่อทดสอบล็อกอินแบบเดียวกับ Get Messages' 20 74 (F 9.5) $C.Text | Out-Null
+    New-Label $d "รับเมล:  $($r.UserName) @ $($r.Server):$($r.Port)$(if ($r.SocketType -eq '3') { ' (SSL)' })" 20 44 (F 9) $C.Muted | Out-Null
+    New-Label $d "ส่งเมล:  $(if ($r.SmtpHost) { "$($r.SmtpHost):$($r.SmtpPort)" } else { '(ไม่ได้ตั้งค่า)' })" 20 62 (F 9) $C.Muted | Out-Null
+    New-Label $d 'ใส่รหัสผ่านของบัญชีนี้ เพื่อทดสอบล็อกอินแบบเดียวกับ Get Messages / Send' 20 90 (F 9.5) $C.Text | Out-Null
     $tb = New-Object Windows.Forms.TextBox
-    $tb.SetBounds(20, 100, 380, 28); $tb.UseSystemPasswordChar = $true; $tb.Font = F 11
+    $tb.SetBounds(20, 116, 400, 28); $tb.UseSystemPasswordChar = $true; $tb.Font = F 11
     $d.Controls.Add($tb)
-    New-Label $d 'ไม่มีการบันทึกรหัสผ่าน ใช้ทดสอบครั้งนี้ครั้งเดียว' 20 134 (F 8.5) $C.Muted | Out-Null
-    $ok = New-Btn $d 'ทดสอบ' 214 152 90 32 -Primary
-    $cancel = New-Btn $d 'ยกเลิก' 310 152 90 32
+    New-Label $d 'ไม่ส่งเมลจริง และไม่บันทึกรหัสผ่าน ใช้ทดสอบครั้งนี้ครั้งเดียว' 20 150 (F 8.5) $C.Muted | Out-Null
+    $ok = New-Btn $d 'ทดสอบ' 234 170 90 32 -Primary
+    $cancel = New-Btn $d 'ยกเลิก' 330 170 90 32
     $ok.DialogResult = 'OK'; $cancel.DialogResult = 'Cancel'
     $d.AcceptButton = $ok; $d.CancelButton = $cancel
     $pw = if ($d.ShowDialog($form) -eq 'OK' -and $tb.Text) { $tb.Text } else { $null }
@@ -1386,7 +1614,7 @@ $timer.Add_Tick({ try {
         $lr = $script:sync.LoginResult
         if ($lr) {
             $lblStatus.Text = "$($script:loginEmail): $($lr.Summary)"; $lblStatus.ForeColor = $(if ($lr.Ok) { $C.Green } else { $C.Red })
-            [Windows.Forms.MessageBox]::Show($form, $lr.Text, "ทดสอบรับเมล - $($script:loginEmail)", 'OK', $(if ($lr.Ok) { 'Information' } else { 'Error' })) | Out-Null
+            [Windows.Forms.MessageBox]::Show($form, $lr.Text, "ทดสอบรับ/ส่งเมล - $($script:loginEmail)", 'OK', $(if ($lr.Ok) { 'Information' } else { 'Error' })) | Out-Null
         }
         return
     }
@@ -1469,16 +1697,42 @@ $btnLogin.Add_Click({
     $pw = Read-Password $r
     if (-not $pw) { return }
     $script:loginEmail = $r.Email
-    Start-Engine 'login' @() @{ Server = $r.Server; Port = $r.Port; SocketType = $r.SocketType; UserName = $r.UserName; Password = $pw }
+    Start-Engine 'login' @() @{ Server = $r.Server; Port = $r.Port; SocketType = $r.SocketType; UserName = $r.UserName; Password = $pw
+        SmtpHost = $r.SmtpHost; SmtpPort = $r.SmtpPort; SmtpUser = $r.SmtpUser; SmtpSocket = $r.SmtpSocket; SmtpAuth = $r.SmtpAuth }
     $pw = $null
 })
 $btnBackup.Add_Click({ if ($script:backupDir -and (Test-Path $script:backupDir)) { Start-Process explorer.exe $script:backupDir } })
-$btnTB.Add_Click({
+# "เปิด Thunderbird" menu: normal start, Troubleshoot Mode (no add-ons), Profile Manager
+function Start-Thunderbird([string[]]$tbArgs) {
     $tb = Find-Thunderbird -IncludeStore
-    if ($tb.Exe)       { Start-Process $tb.Exe }
-    elseif ($tb.AppId) { Start-Process explorer.exe "shell:AppsFolder\$($tb.AppId)" }   # Microsoft Store version
-    else { [Windows.Forms.MessageBox]::Show($form, 'ไม่พบโปรแกรม Thunderbird ในเครื่องนี้', 'Thunderbird Fix', 'OK', 'Warning') | Out-Null }
-})
+    if (-not $tb) { [Windows.Forms.MessageBox]::Show($form, 'ไม่พบโปรแกรม Thunderbird ในเครื่องนี้', 'Thunderbird Fix', 'OK', 'Warning') | Out-Null; return }
+    if ($tbArgs -and (Get-Process thunderbird -ErrorAction SilentlyContinue)) {
+        # these options only work when Thunderbird starts fresh
+        $a = [Windows.Forms.MessageBox]::Show($form, 'ต้องปิด Thunderbird ที่เปิดอยู่ก่อน ปิดให้เลยไหม?', 'Thunderbird Fix', 'YesNo', 'Question')
+        if ($a -ne 'Yes') { return }
+        Get-Process thunderbird -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+        for ($i = 0; $i -lt 30 -and (Get-Process thunderbird -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 500 }
+        Get-Process thunderbird -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    if ($tb.Exe) {
+        if ($tbArgs) { Start-Process $tb.Exe -ArgumentList $tbArgs } else { Start-Process $tb.Exe }
+    } elseif ($tb.AppId) {   # Microsoft Store version: no command-line options through the app launcher
+        if ($tbArgs) {
+            [Windows.Forms.MessageBox]::Show($form, 'Thunderbird จาก Microsoft Store: กดปุ่ม Shift ค้างไว้ตอนเปิด Thunderbird เพื่อเข้า Troubleshoot Mode', 'Thunderbird Fix', 'OK', 'Information') | Out-Null
+        }
+        Start-Process explorer.exe "shell:AppsFolder\$($tb.AppId)"
+    }
+}
+$tbMenu = New-Object Windows.Forms.ContextMenuStrip
+$tbMenu.Font = F 10
+$miNormal = $tbMenu.Items.Add('เปิด Thunderbird ตามปกติ')
+$miSafe   = $tbMenu.Items.Add('เปิดแบบไม่โหลด Add-on (Troubleshoot Mode) - ใช้เมื่อ Thunderbird ค้าง / ปิดตัวเอง')
+$miPm     = $tbMenu.Items.Add('เลือกโปรไฟล์ (Profile Manager) - ใช้เมื่อเปิดมาแล้วเมลหาย')
+$miNormal.Add_Click({ Start-Thunderbird @() })
+$miSafe.Add_Click({ Start-Thunderbird @('-safe-mode') })
+$miPm.Add_Click({ Start-Thunderbird @('-P') })
+$btnTB.Text = 'เปิด Thunderbird ▾'
+$btnTB.Add_Click({ $tbMenu.Show($btnTB, (New-Object Drawing.Point(0, $btnTB.Height))) })
 $lnkAdd.Add_LinkClicked({
     $fb = New-Object Windows.Forms.FolderBrowserDialog
     $fb.Description = 'เลือกโฟลเดอร์โปรไฟล์ Thunderbird (โฟลเดอร์ที่มีไฟล์ prefs.js) เช่น ThunderbirdPortable\Data\profile'

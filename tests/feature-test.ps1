@@ -41,7 +41,17 @@ $tbRoot = "$Root\user\AppData\Roaming\Thunderbird"; $prof = "$tbRoot\Profiles\te
 $good  = "$prof\Mail\pop.good-company.com"; $bad = "$prof\Mail\imap.broken-company.com"
 $quiet = "$prof\Mail\pop.quiet-company.com"; $local = "$prof\Mail\Local Folders"
 New-Item -ItemType Directory -Force $good, $bad, $quiet, $local, "$Root\temp", "$Root\desktop" | Out-Null
-Set-Content "$tbRoot\profiles.ini" "[Profile0]`nName=test`nIsRelative=1`nPath=Profiles/test.default`n"
+# "all my mail is gone": Thunderbird opens an EMPTY profile, and profiles.ini no longer even lists
+# the profile that holds the mail (test.default) - only the Profiles folder still has it
+$empty = "$tbRoot\Profiles\empty.default"
+New-Item -ItemType Directory -Force $empty | Out-Null
+Set-Content "$empty\prefs.js" 'user_pref("browser.startup.homepage_override.mstone", "128.0");'
+Set-Content "$tbRoot\installs.ini" "[ABCDEF0123456789]`nDefault=Profiles/empty.default`nLocked=1`n"
+Set-Content "$tbRoot\profiles.ini" "[InstallABCDEF0123456789]`nDefault=Profiles/empty.default`nLocked=1`n`n[Profile0]`nName=empty`nIsRelative=1`nPath=Profiles/empty.default`n`n[General]`nStartWithLastProfile=1`nVersion=2`n"
+# crashes in the last week + a third-party add-on
+New-Item -ItemType Directory -Force "$tbRoot\Crash Reports\pending" | Out-Null
+Set-Content "$tbRoot\Crash Reports\pending\a.dmp" 'x'; Set-Content "$tbRoot\Crash Reports\pending\b.dmp" 'x'
+Set-Content "$prof\extensions.json" '{"addons":[{"id":"toolbar@x","type":"extension","active":true,"location":"app-profile","defaultLocale":{"name":"Super Toolbar"}},{"id":"builtin@mozilla","type":"extension","active":true,"location":"app-builtin","defaultLocale":{"name":"Built-in"}}]}'
 
 # plain listener (accepts, says nothing) for SMTP/IMAP; port 1 on localhost is closed
 $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $listener.Start()
@@ -70,12 +80,44 @@ $popServer = [PowerShell]::Create().AddScript({
     }
 }).AddArgument($popListener)
 [void]$popServer.BeginInvoke()
+# fake SMTP server: AUTH PLAIN / LOGIN with password "secret" -> 235, otherwise 535; never accepts mail
+$smtpListener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $smtpListener.Start()
+$smtpPort = $smtpListener.LocalEndpoint.Port
+$smtpServer = [PowerShell]::Create().AddScript({
+    param($l)
+    while ($true) {
+        try { $c = $l.AcceptTcpClient() } catch { break }
+        try {
+            $s = $c.GetStream(); $s.ReadTimeout = 20000
+            $r = New-Object IO.StreamReader($s); $w = New-Object IO.StreamWriter($s); $w.NewLine = "`r`n"; $w.AutoFlush = $true
+            $w.WriteLine('220 fake.smtp ESMTP ready')
+            $step = ''; $user = ''
+            while ($null -ne ($line = $r.ReadLine())) {
+                $ok = { param($u, $p) $u -eq 'sales' -and $p -eq 'secret' }
+                $dec = { param($b) [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)) }
+                if ($step -eq 'user') { $user = & $dec $line; $step = 'pass'; $w.WriteLine('334 UGFzc3dvcmQ6') }
+                elseif ($step -eq 'pass') { $step = ''; if (& $ok $user (& $dec $line)) { $w.WriteLine('235 2.7.0 Authentication successful') } else { $w.WriteLine('535 5.7.8 Authentication credentials invalid') } }
+                elseif ($line -like 'EHLO *') { $w.WriteLine('250-fake.smtp'); $w.WriteLine('250-AUTH PLAIN LOGIN'); $w.WriteLine('250 8BITMIME') }
+                elseif ($line -like 'AUTH PLAIN *') {
+                    $parts = (& $dec $line.Substring(11)).Split([char]0)
+                    if (& $ok $parts[1] $parts[2]) { $w.WriteLine('235 2.7.0 Authentication successful') } else { $w.WriteLine('535 5.7.8 Authentication credentials invalid') }
+                }
+                elseif ($line -eq 'AUTH LOGIN') { $step = 'user'; $w.WriteLine('334 VXNlcm5hbWU6') }
+                elseif ($line -eq 'QUIT') { $w.WriteLine('221 bye'); break }
+                else { $w.WriteLine('502 not implemented') }
+            }
+        } catch {}
+        $c.Close()
+    }
+}).AddArgument($smtpListener)
+[void]$smtpServer.BeginInvoke()
 
 Set-Content "$prof\prefs.js" @"
 user_pref("mail.accountmanager.accounts", "account1,account2,account3,account4");
 user_pref("mail.smtp.defaultserver", "smtp1");
 user_pref("mail.smtpserver.smtp1.hostname", "127.0.0.1");
-user_pref("mail.smtpserver.smtp1.port", $port);
+user_pref("mail.smtpserver.smtp1.port", $smtpPort);
+user_pref("mail.smtpserver.smtp1.username", "sales");
 user_pref("mail.account.account1.server", "server1");
 user_pref("mail.account.account1.identities", "id1");
 user_pref("mail.identity.id1.useremail", "sales@good-company.com");
@@ -182,7 +224,12 @@ function Run-Engine($opt) {
 }
 $s = Run-Engine @{ Mode = 'scan'; Targets = @(); IsAdmin = $false }
 function Codes($email) { @(($s.Results | Where-Object Email -eq $email).Issues | ForEach-Object Code) }
-Check 'scan: good POP3 account is normal'              (($s.Results | Where-Object Email -eq 'sales@good-company.com').Status -eq 'ok')
+$goodCodes = Codes 'sales@good-company.com'
+Check 'scan: unlisted mail profile still found'          ([bool]($s.Results | Where-Object Email -eq 'sales@good-company.com'))
+Check 'scan: wrong default profile detected'             ($goodCodes -contains 'PROFILE_DEFAULT') ($goodCodes -join ',')
+$crash = ($s.Results | Where-Object Email -eq 'sales@good-company.com').Issues | Where-Object Code -eq 'CRASH'
+Check 'scan: crashes + third-party add-on named'         ($crash.Text -match ' 2 ' -and $crash.Text -match 'Super Toolbar' -and $crash.Text -notmatch 'Built-in') "$($crash.Text)"
+Check 'scan: good POP3 account has no other problem'     (-not ($goodCodes | Where-Object { $_ -notin 'PROFILE_DEFAULT', 'CRASH' })) ($goodCodes -join ',')
 $badCodes = Codes 'process@broken-company.com'
 Check 'scan: broken account (RO, nstmp, msf, ACL, lock)' (-not (Compare-Object @('READONLY','NSTMP','MSF','NOWRITE','LOCKED') $badCodes | Where-Object SideIndicator -eq '<=')) ($badCodes -join ',')
 $quietCodes = Codes 'quiet@quiet-company.com'
@@ -190,10 +237,17 @@ Check 'scan: quiet POP3 (nocheck, net, popstate, leave, filter)' (-not (Compare-
 $localCodes = Codes 'Local Folders'
 $junk = ($s.Results | Where-Object Email -eq 'Local Folders').Issues | Where-Object Code -eq 'JUNK'
 Check 'scan: Local Folders Junk (2 recent) + Outbox'     (($localCodes -contains 'OUTBOX') -and $junk.Text -match ' 2 ') ($localCodes -join ',')
-$s = Run-Engine @{ Mode = 'login'; Login = @{ Server = '127.0.0.1'; Port = $popPort; SocketType = '0'; UserName = 'sales'; Password = 'secret' } }
-Check 'login: right password -> OK, 3 messages'          ($s.LoginResult.Ok -and $s.LoginResult.Summary -match ' 3 ') $s.LoginResult.Summary
-$s = Run-Engine @{ Mode = 'login'; Login = @{ Server = '127.0.0.1'; Port = $popPort; SocketType = '0'; UserName = 'sales'; Password = 'wrong' } }
-Check 'login: wrong password -> explained'               ((-not $s.LoginResult.Ok) -and $s.LoginResult.Text -match 'AUTH') $s.LoginResult.Summary
+$loginOpt = { param($pw) @{ Mode = 'login'; Login = @{ Server = '127.0.0.1'; Port = $popPort; SocketType = '0'; UserName = 'sales'; Password = $pw
+                              SmtpHost = '127.0.0.1'; SmtpPort = $smtpPort; SmtpUser = 'sales'; SmtpSocket = '0'; SmtpAuth = '3' } } }
+$s = Run-Engine (& $loginOpt 'secret')
+Check 'login: right password -> receive OK, 3 messages'  ($s.LoginResult.RecvOk -and $s.LoginResult.Summary -match ' 3 ') $s.LoginResult.Summary
+Check 'login: right password -> send (SMTP) OK'          ($s.LoginResult.SendOk -and $s.LoginResult.Text -match '235|สำเร็จ - ส่งเมลได้') ''
+$s = Run-Engine (& $loginOpt 'wrong')
+Check 'login: wrong password -> receive explained'       ((-not $s.LoginResult.RecvOk) -and $s.LoginResult.Text -match 'AUTH') ''
+Check 'login: wrong password -> send explained (535)'    ((-not $s.LoginResult.SendOk) -and $s.LoginResult.Text -match 'รหัสผ่านสำหรับส่งเมลไม่ถูกต้อง' -and $s.LoginResult.Text -match '535') ''
+$s = Run-Engine @{ Mode = 'login'; Login = @{ Server = '127.0.0.1'; Port = $popPort; SocketType = '0'; UserName = 'sales'; Password = 'secret'
+                   SmtpHost = '127.0.0.1'; SmtpPort = 1; SmtpSocket = '0'; SmtpAuth = '3' } }
+Check 'login: blocked SMTP port -> explained'            ((-not $s.LoginResult.SendOk) -and $s.LoginResult.Text -match 'บล็อกพอร์ต') ''
 
 # --- the real window ------------------------------------------------------------
 if ($Build) { & powershell -NoProfile -ExecutionPolicy Bypass -File $Build -Script "$Root\tool.ps1" -Out "$Root\test.exe" | Out-Null }
@@ -247,21 +301,44 @@ try {
     [Native.Cap]::PostMessage($lvH, 0x201, [IntPtr]1, $lp) | Out-Null; [Native.Cap]::PostMessage($lvH, 0x202, [IntPtr]0, $lp) | Out-Null
     Start-Sleep -Seconds 1
     foreach ($try in @(@('secret', 'feature-3-login-ok'), @('wrong', 'feature-4-login-bad'))) {
-        [void](Click $main 'ทดสอบรับเมล')
-        $dlg = Find-Win $p.Id 'ทดสอบการรับเมล' 15
+        [void](Click $main 'ทดสอบรับ/ส่งเมล')
+        $dlg = Find-Win $p.Id 'ทดสอบการรับ/ส่งเมล' 15
         $ok = [bool]$dlg
         if ($dlg) {
             $edit = $dlg.FindAll('Descendants', [Windows.Automation.Condition]::TrueCondition) |
                 Where-Object { $_.Current.ClassName -like '*EDIT*' } | Select-Object -First 1
             [Native.Cap]::SendMessage([IntPtr]$edit.Current.NativeWindowHandle, 0x000C, [IntPtr]::Zero, $try[0]) | Out-Null
             [void](Click $dlg 'ทดสอบ')
-            $res = Find-Win $p.Id 'ทดสอบรับเมล - sales@good-company.com' 30
+            $res = Find-Win $p.Id 'ทดสอบรับ/ส่งเมล - sales@good-company.com' 30
             $ok = [bool]$res
             if ($res) { Start-Sleep -Milliseconds 500; Shot ([IntPtr]$res.Current.NativeWindowHandle) "$($try[1])-box"; [void](Click $res 'OK') }
         }
         Check "window: receive test with '$($try[0])' shows a result" $ok
         Start-Sleep -Milliseconds 500
     }
+
+    # "เปิด Thunderbird" menu: normal / Troubleshoot Mode / Profile Manager
+    # (WinForms drop-downs show up as a Pane without UIA items, so the screenshot is the item check)
+    $pidCond = New-Object Windows.Automation.PropertyCondition($uia::ProcessIdProperty, [int]$p.Id)
+    $isDrop = { $_.Current.ControlType -eq [Windows.Automation.ControlType]::Pane -and $_.Current.ClassName -like 'WindowsForms10.Window.*' }
+    $before = @($uia::RootElement.FindAll('Children', $pidCond) | Where-Object $isDrop | ForEach-Object { $_.Current.NativeWindowHandle })
+    # a real click makes the window active first; a drop-down on an inactive window closes at once
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    try { [Microsoft.VisualBasic.Interaction]::AppActivate($p.Id) } catch {}
+    Start-Sleep -Milliseconds 500
+    [void](Click $main 'เปิด Thunderbird ▾')
+    Start-Sleep -Milliseconds 800
+    # the drop-down is owned by the main window, so UIA lists it under it
+    $drop = @($uia::RootElement.FindAll('Children', $pidCond)) + @($main.FindAll('Children', [Windows.Automation.Condition]::TrueCondition)) |
+        Where-Object $isDrop | Where-Object { $_.Current.NativeWindowHandle -ne $main.Current.NativeWindowHandle -and $_.Current.BoundingRectangle.Width -gt 0 -and $_.Current.BoundingRectangle.Height -lt 400 } |
+        Select-Object -First 1
+    $seen = ($uia::RootElement.FindAll('Children', $pidCond) | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType.')[$($_.Current.ClassName -replace 'WindowsForms10.','' -replace '\.app\..*','')] w=$([int]$_.Current.BoundingRectangle.Width)" }) -join '; '
+    Check 'menu: "เปิด Thunderbird" drop-down opens' ([bool]$drop) $(if ($drop) { "screenshot feature-6-menu.png" } else { "before=$($before -join ',') now: $seen" })
+    if ($drop) {
+        Shot ([IntPtr]$drop.Current.NativeWindowHandle) 'feature-6-menu'
+        [Native.Cap]::PostMessage([IntPtr]$drop.Current.NativeWindowHandle, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null   # Esc closes it
+    }
+    Start-Sleep -Milliseconds 500
 
     # single instance: a second copy must bring the first forward and quit
     $p2 = Start-Tool
@@ -279,11 +356,15 @@ try {
 }
 finally {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-    $listener.Stop(); $popListener.Stop()
+    $listener.Stop(); $popListener.Stop(); $smtpListener.Stop()
     Check 'fix: Thunderbird temp file removed'   (@(Get-ChildItem "$Root\temp" -Filter 'nsmail*').Count -eq 0)
     Check 'fix: read-only cleared'               (-not (Get-Item "$bad\Sent").IsReadOnly)
     Check 'fix: deny-write permission repaired'  $(try { [IO.File]::Open("$bad\Trash", 'Open', 'ReadWrite', 'ReadWrite').Close(); $true } catch { $false })
     Check 'fix: check-new-mail turned back on'   ((Select-String -Path "$prof\prefs.js" -Pattern 'server3.check_new_mail", true').Count -eq 1)
+    Check 'fix: installs.ini now opens the mail profile'   ((Get-Content "$tbRoot\installs.ini") -contains 'Default=Profiles/test.default') ((Get-Content "$tbRoot\installs.ini") -join ' ')
+    $pini = Get-Content "$tbRoot\profiles.ini"
+    Check 'fix: profiles.ini lists + opens mail profile'   (($pini -contains 'Path=Profiles/test.default') -and ($pini -contains 'Default=Profiles/test.default')) ($pini -join ' ')
+    Check 'fix: old installs.ini / profiles.ini backed up' (@(Get-ChildItem "$Root\desktop" -Recurse -Filter '*.ini.bak').Count -eq 2)
     Check 'fix: popstate.dat moved to backup'    ((-not (Test-Path "$quiet\popstate.dat")) -and @(Get-ChildItem "$Root\desktop" -Recurse -Filter 'popstate.dat').Count -eq 1)
     Check 'mail content untouched'               ((Get-Content "$bad\Inbox") -join ' ' -eq 'From - test hello' -and (Select-String -Path "$local\Junk" -Pattern '^customer').Count -eq 2)
     Check 'optimize: bloated database compacted' ((Get-Item "$prof\places.sqlite").Length -lt $placesBefore / 10) "$([int]($placesBefore/1KB)) KB -> $([int]((Get-Item "$prof\places.sqlite").Length/1KB)) KB"
